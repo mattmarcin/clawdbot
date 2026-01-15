@@ -1,0 +1,69 @@
+# Clawdbot for Coolify
+# 
+# Fork https://github.com/clawdbot/clawdbot and replace their docker-compose.yml with this one.
+#
+# After container is running:
+# 1. Open terminal in Coolify for the clawdbot container
+# 2. Run: node dist/index.js onboard
+# 3. Follow the wizard to configure everything
+
+services:
+  clawdbot-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      NODE_ENV: production
+      # These get set during onboarding, but can also be set in Coolify env vars
+      CLAWDBOT_GATEWAY_TOKEN: '${CLAWDBOT_GATEWAY_TOKEN:-}'
+      CLAUDE_AI_SESSION_KEY: '${CLAUDE_AI_SESSION_KEY:-}'
+      CLAUDE_WEB_SESSION_KEY: '${CLAUDE_WEB_SESSION_KEY:-}'
+      CLAUDE_WEB_COOKIE: '${CLAUDE_WEB_COOKIE:-}'
+    volumes:
+      - clawdbot_config:/home/node/.clawdbot
+      - clawdbot_workspace:/home/node/clawd
+    # Use expose for Coolify/Traefik routing instead of ports
+    expose:
+      - "18789"
+      - "18790"
+    init: true
+    restart: unless-stopped
+    command:
+      - node
+      - dist/index.js
+      - gateway-daemon
+      - '--bind'
+      - '0.0.0.0'
+      - '--port'
+      - '18789'
+
+  # CLI container - use via: docker compose run --rm clawdbot-cli <command>
+  # Or access gateway container terminal directly in Coolify
+  clawdbot-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - cli
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      BROWSER: echo
+      CLAUDE_AI_SESSION_KEY: '${CLAUDE_AI_SESSION_KEY:-}'
+      CLAUDE_WEB_SESSION_KEY: '${CLAUDE_WEB_SESSION_KEY:-}'
+      CLAUDE_WEB_COOKIE: '${CLAUDE_WEB_COOKIE:-}'
+    volumes:
+      - clawdbot_config:/home/node/.clawdbot
+      - clawdbot_workspace:/home/node/clawd
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint:
+      - node
+      - dist/index.js
+
+volumes:
+  clawdbot_config:
+  clawdbot_workspace:
