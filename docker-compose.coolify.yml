@@ -38,6 +38,7 @@ services:
       - '0.0.0.0'
       - '--port'
       - '18789'
+      - '--allow-unconfigured'
 
   # CLI container - use via: docker compose run --rm clawdbot-cli <command>
   # Or access gateway container terminal directly in Coolify
