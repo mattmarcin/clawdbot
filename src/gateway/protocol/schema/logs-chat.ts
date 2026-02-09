@@ -1,5 +1,4 @@
 import { Type } from "@sinclair/typebox";
-
 import { NonEmptyString } from "./primitives.js";
 
 export const LogsTailParamsSchema = Type.Object(
@@ -35,7 +34,7 @@ export const ChatHistoryParamsSchema = Type.Object(
 export const ChatSendParamsSchema = Type.Object(
   {
     sessionKey: NonEmptyString,
-    message: NonEmptyString,
+    message: Type.String(),
     thinking: Type.Optional(Type.String()),
     deliver: Type.Optional(Type.Boolean()),
     attachments: Type.Optional(Type.Array(Type.Unknown())),
@@ -49,6 +48,15 @@ export const ChatAbortParamsSchema = Type.Object(
   {
     sessionKey: NonEmptyString,
     runId: Type.Optional(NonEmptyString),
+  },
+  { additionalProperties: false },
+);
+
+export const ChatInjectParamsSchema = Type.Object(
+  {
+    sessionKey: NonEmptyString,
+    message: NonEmptyString,
+    label: Type.Optional(Type.String({ maxLength: 100 })),
   },
   { additionalProperties: false },
 );

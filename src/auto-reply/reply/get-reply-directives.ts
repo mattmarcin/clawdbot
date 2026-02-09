@@ -1,11 +1,15 @@
+import type { ExecToolDefaults } from "../../agents/bash-tools.js";
 import type { ModelAliasIndex } from "../../agents/model-selection.js";
-import { resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
-import type { ClawdbotConfig } from "../../config/config.js";
+import type { SkillCommandSpec } from "../../agents/skills.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
-import { listChatCommands, shouldHandleTextCommands } from "../commands-registry.js";
 import type { MsgContext, TemplateContext } from "../templating.js";
 import type { ElevatedLevel, ReasoningLevel, ThinkLevel, VerboseLevel } from "../thinking.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import type { TypingController } from "./typing.js";
+import { resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
+import { listChatCommands, shouldHandleTextCommands } from "../commands-registry.js";
+import { listSkillCommandsForWorkspace } from "../skill-commands.js";
 import { resolveBlockStreamingChunking } from "./block-streaming.js";
 import { buildCommandContext } from "./commands.js";
 import { type InlineDirectives, parseInlineDirectives } from "./directive-handling.js";
@@ -16,14 +20,15 @@ import { CURRENT_MESSAGE_MARKER, stripMentions, stripStructuralPrefixes } from "
 import { createModelSelectionState, resolveContextTokens } from "./model-selection.js";
 import { formatElevatedUnavailableMessage, resolveElevatedPermissions } from "./reply-elevated.js";
 import { stripInlineStatus } from "./reply-inline.js";
-import type { TypingController } from "./typing.js";
 
-type AgentDefaults = NonNullable<ClawdbotConfig["agents"]>["defaults"];
+type AgentDefaults = NonNullable<OpenClawConfig["agents"]>["defaults"];
+type ExecOverrides = Pick<ExecToolDefaults, "host" | "security" | "ask" | "node">;
 
 export type ReplyDirectiveContinuation = {
   commandSource: string;
   command: ReturnType<typeof buildCommandContext>;
   allowTextCommands: boolean;
+  skillCommands?: SkillCommandSpec[];
   directives: InlineDirectives;
   cleanedBody: string;
   messageProviderKey: string;
@@ -35,11 +40,13 @@ export type ReplyDirectiveContinuation = {
   resolvedVerboseLevel: VerboseLevel | undefined;
   resolvedReasoningLevel: ReasoningLevel;
   resolvedElevatedLevel: ElevatedLevel;
+  execOverrides?: ExecOverrides;
   blockStreamingEnabled: boolean;
   blockReplyChunking?: {
     minChars: number;
     maxChars: number;
     breakPreference: "paragraph" | "newline" | "sentence";
+    flushOnParagraph?: boolean;
   };
   resolvedBlockStreamingBreak: "text_end" | "message_end";
   provider: string;
@@ -56,19 +63,37 @@ export type ReplyDirectiveContinuation = {
   };
 };
 
+function resolveExecOverrides(params: {
+  directives: InlineDirectives;
+  sessionEntry?: SessionEntry;
+}): ExecOverrides | undefined {
+  const host =
+    params.directives.execHost ?? (params.sessionEntry?.execHost as ExecOverrides["host"]);
+  const security =
+    params.directives.execSecurity ??
+    (params.sessionEntry?.execSecurity as ExecOverrides["security"]);
+  const ask = params.directives.execAsk ?? (params.sessionEntry?.execAsk as ExecOverrides["ask"]);
+  const node = params.directives.execNode ?? params.sessionEntry?.execNode;
+  if (!host && !security && !ask && !node) {
+    return undefined;
+  }
+  return { host, security, ask, node };
+}
+
 export type ReplyDirectiveResult =
   | { kind: "reply"; reply: ReplyPayload | ReplyPayload[] | undefined }
   | { kind: "continue"; result: ReplyDirectiveContinuation };
 
 export async function resolveReplyDirectives(params: {
   ctx: MsgContext;
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   agentId: string;
   agentDir: string;
+  workspaceDir: string;
   agentCfg: AgentDefaults;
   sessionCtx: TemplateContext;
-  sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
+  sessionEntry: SessionEntry;
+  sessionStore: Record<string, SessionEntry>;
   sessionKey: string;
   storePath?: string;
   sessionScope: Parameters<typeof applyInlineDirectiveOverrides>[0]["sessionScope"];
@@ -83,6 +108,7 @@ export async function resolveReplyDirectives(params: {
   model: string;
   typing: TypingController;
   opts?: GetReplyOptions;
+  skillFilter?: string[];
 }): Promise<ReplyDirectiveResult> {
   const {
     ctx,
@@ -90,6 +116,7 @@ export async function resolveReplyDirectives(params: {
     agentId,
     agentCfg,
     agentDir,
+    workspaceDir,
     sessionCtx,
     sessionEntry,
     sessionStore,
@@ -106,6 +133,7 @@ export async function resolveReplyDirectives(params: {
     model: initialModel,
     typing,
     opts,
+    skillFilter,
   } = params;
   let provider = initialProvider;
   let model = initialModel;
@@ -113,11 +141,18 @@ export async function resolveReplyDirectives(params: {
   // Prefer CommandBody/RawBody (clean message without structural context) for directive parsing.
   // Keep `Body`/`BodyStripped` as the best-available prompt text (may include context).
   const commandSource =
+    sessionCtx.BodyForCommands ??
     sessionCtx.CommandBody ??
     sessionCtx.RawBody ??
+    sessionCtx.Transcript ??
     sessionCtx.BodyStripped ??
     sessionCtx.Body ??
+    ctx.BodyForCommands ??
+    ctx.CommandBody ??
+    ctx.RawBody ??
     "";
+  const promptSource = sessionCtx.BodyForAgent ?? sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
+  const commandText = commandSource || promptSource;
   const command = buildCommandContext({
     ctx,
     cfg,
@@ -132,17 +167,29 @@ export async function resolveReplyDirectives(params: {
     surface: command.surface,
     commandSource: ctx.CommandSource,
   });
+  const shouldResolveSkillCommands =
+    allowTextCommands && command.commandBodyNormalized.includes("/");
+  const skillCommands = shouldResolveSkillCommands
+    ? listSkillCommandsForWorkspace({
+        workspaceDir,
+        cfg,
+        skillFilter,
+      })
+    : [];
   const reservedCommands = new Set(
     listChatCommands().flatMap((cmd) =>
       cmd.textAliases.map((a) => a.replace(/^\//, "").toLowerCase()),
     ),
   );
+  for (const command of skillCommands) {
+    reservedCommands.add(command.name.toLowerCase());
+  }
   const configuredAliases = Object.values(cfg.agents?.defaults?.models ?? {})
     .map((entry) => entry.alias?.trim())
     .filter((alias): alias is string => Boolean(alias))
     .filter((alias) => !reservedCommands.has(alias.toLowerCase()));
   const allowStatusDirective = allowTextCommands && command.isAuthorizedSender;
-  let parsedDirectives = parseInlineDirectives(commandSource, {
+  let parsedDirectives = parseInlineDirectives(commandText, {
     modelAliases: configuredAliases,
     allowStatusDirective,
   });
@@ -164,11 +211,33 @@ export async function resolveReplyDirectives(params: {
       };
     }
   }
+  if (isGroup && ctx.WasMentioned !== true && parsedDirectives.hasExecDirective) {
+    if (parsedDirectives.execSecurity !== "deny") {
+      parsedDirectives = {
+        ...parsedDirectives,
+        hasExecDirective: false,
+        execHost: undefined,
+        execSecurity: undefined,
+        execAsk: undefined,
+        execNode: undefined,
+        rawExecHost: undefined,
+        rawExecSecurity: undefined,
+        rawExecAsk: undefined,
+        rawExecNode: undefined,
+        hasExecOptions: false,
+        invalidExecHost: false,
+        invalidExecSecurity: false,
+        invalidExecAsk: false,
+        invalidExecNode: false,
+      };
+    }
+  }
   const hasInlineDirective =
     parsedDirectives.hasThinkDirective ||
     parsedDirectives.hasVerboseDirective ||
     parsedDirectives.hasReasoningDirective ||
     parsedDirectives.hasElevatedDirective ||
+    parsedDirectives.hasExecDirective ||
     parsedDirectives.hasModelDirective ||
     parsedDirectives.hasQueueDirective;
   if (hasInlineDirective) {
@@ -204,7 +273,9 @@ export async function resolveReplyDirectives(params: {
       };
   const existingBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
   let cleanedBody = (() => {
-    if (!existingBody) return parsedDirectives.cleaned;
+    if (!existingBody) {
+      return parsedDirectives.cleaned;
+    }
     if (!sessionCtx.CommandBody && !sessionCtx.RawBody) {
       return parseInlineDirectives(existingBody, {
         modelAliases: configuredAliases,
@@ -233,6 +304,7 @@ export async function resolveReplyDirectives(params: {
     cleanedBody = stripInlineStatus(cleanedBody).cleaned;
   }
 
+  sessionCtx.BodyForAgent = cleanedBody;
   sessionCtx.Body = cleanedBody;
   sessionCtx.BodyStripped = cleanedBody;
 
@@ -272,20 +344,20 @@ export async function resolveReplyDirectives(params: {
   });
   const defaultActivation = defaultGroupActivation(requireMention);
   const resolvedThinkLevel =
-    (directives.thinkLevel as ThinkLevel | undefined) ??
+    directives.thinkLevel ??
     (sessionEntry?.thinkingLevel as ThinkLevel | undefined) ??
     (agentCfg?.thinkingDefault as ThinkLevel | undefined);
 
   const resolvedVerboseLevel =
-    (directives.verboseLevel as VerboseLevel | undefined) ??
+    directives.verboseLevel ??
     (sessionEntry?.verboseLevel as VerboseLevel | undefined) ??
     (agentCfg?.verboseDefault as VerboseLevel | undefined);
   const resolvedReasoningLevel: ReasoningLevel =
-    (directives.reasoningLevel as ReasoningLevel | undefined) ??
+    directives.reasoningLevel ??
     (sessionEntry?.reasoningLevel as ReasoningLevel | undefined) ??
     "off";
   const resolvedElevatedLevel = elevatedAllowed
-    ? ((directives.elevatedLevel as ElevatedLevel | undefined) ??
+    ? (directives.elevatedLevel ??
       (sessionEntry?.elevatedLevel as ElevatedLevel | undefined) ??
       (agentCfg?.elevatedDefault as ElevatedLevel | undefined) ??
       "on")
@@ -312,6 +384,7 @@ export async function resolveReplyDirectives(params: {
     sessionEntry,
     sessionStore,
     sessionKey,
+    parentSessionKey: ctx.ParentSessionKey,
     storePath,
     defaultProvider,
     defaultModel,
@@ -378,13 +451,15 @@ export async function resolveReplyDirectives(params: {
   model = applyResult.model;
   contextTokens = applyResult.contextTokens;
   const { directiveAck, perMessageQueueMode, perMessageQueueOptions } = applyResult;
+  const execOverrides = resolveExecOverrides({ directives, sessionEntry });
 
   return {
     kind: "continue",
     result: {
-      commandSource,
+      commandSource: commandText,
       command,
       allowTextCommands,
+      skillCommands,
       directives,
       cleanedBody,
       messageProviderKey,
@@ -396,6 +471,7 @@ export async function resolveReplyDirectives(params: {
       resolvedVerboseLevel,
       resolvedReasoningLevel,
       resolvedElevatedLevel,
+      execOverrides,
       blockStreamingEnabled,
       blockReplyChunking,
       resolvedBlockStreamingBreak,

@@ -1,17 +1,14 @@
-import type { ClawdbotConfig } from "../config/config.js";
-import { hasAnyWhatsAppAuth } from "../web/accounts.js";
-
-export function normalizeLegacyConfigValues(cfg: ClawdbotConfig): {
-  config: ClawdbotConfig;
+import type { OpenClawConfig } from "../config/config.js";
+export function normalizeLegacyConfigValues(cfg: OpenClawConfig): {
+  config: OpenClawConfig;
   changes: string[];
 } {
   const changes: string[] = [];
-  let next: ClawdbotConfig = cfg;
+  let next: OpenClawConfig = cfg;
 
   const legacyAckReaction = cfg.messages?.ackReaction?.trim();
   const hasWhatsAppConfig = cfg.channels?.whatsapp !== undefined;
-  const hasWhatsAppAuth = hasAnyWhatsAppAuth(cfg);
-  if (legacyAckReaction && (hasWhatsAppConfig || hasWhatsAppAuth)) {
+  if (legacyAckReaction && hasWhatsAppConfig) {
     const hasWhatsAppAck = cfg.channels?.whatsapp?.ackReaction !== undefined;
     if (!hasWhatsAppAck) {
       const legacyScope = cfg.messages?.ackReactionScope ?? "group-mentions";

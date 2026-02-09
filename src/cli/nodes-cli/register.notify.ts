@@ -1,8 +1,9 @@
 import type { Command } from "commander";
+import type { NodesRpcOpts } from "./types.js";
 import { randomIdempotencyKey } from "../../gateway/call.js";
 import { defaultRuntime } from "../../runtime.js";
+import { getNodesTheme, runNodesCommand } from "./cli-utils.js";
 import { callGatewayCli, nodesCallOpts, resolveNodeId } from "./rpc.js";
-import type { NodesRpcOpts } from "./types.js";
 
 export function registerNodesNotifyCommand(nodes: Command) {
   nodesCallOpts(
@@ -17,7 +18,7 @@ export function registerNodesNotifyCommand(nodes: Command) {
       .option("--delivery <system|overlay|auto>", "Delivery mode", "system")
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms (default 15000)", "15000")
       .action(async (opts: NodesRpcOpts) => {
-        try {
+        await runNodesCommand("notify", async () => {
           const nodeId = await resolveNodeId(opts, String(opts.node ?? ""));
           const title = String(opts.title ?? "").trim();
           const body = String(opts.body ?? "").trim();
@@ -48,11 +49,9 @@ export function registerNodesNotifyCommand(nodes: Command) {
             defaultRuntime.log(JSON.stringify(result, null, 2));
             return;
           }
-          defaultRuntime.log("notify ok");
-        } catch (err) {
-          defaultRuntime.error(`nodes notify failed: ${String(err)}`);
-          defaultRuntime.exit(1);
-        }
+          const { ok } = getNodesTheme();
+          defaultRuntime.log(ok("notify ok"));
+        });
       }),
   );
 }

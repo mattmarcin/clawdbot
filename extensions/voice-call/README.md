@@ -1,21 +1,23 @@
-# @clawdbot/voice-call
+# @openclaw/voice-call
 
-Official Voice Call plugin for **Clawdbot**.
+Official Voice Call plugin for **OpenClaw**.
 
 Providers:
+
 - **Twilio** (Programmable Voice + Media Streams)
 - **Telnyx** (Call Control v2)
+- **Plivo** (Voice API + XML transfer + GetInput speech)
 - **Mock** (dev/no network)
 
-Docs: `https://docs.clawd.bot/plugins/voice-call`
-Plugin system: `https://docs.clawd.bot/plugin`
+Docs: `https://docs.openclaw.ai/plugins/voice-call`
+Plugin system: `https://docs.openclaw.ai/plugin`
 
 ## Install (local dev)
 
-### Option A: install via Clawdbot (recommended)
+### Option A: install via OpenClaw (recommended)
 
 ```bash
-clawdbot plugins install @clawdbot/voice-call
+openclaw plugins install @openclaw/voice-call
 ```
 
 Restart the Gateway afterwards.
@@ -23,9 +25,9 @@ Restart the Gateway afterwards.
 ### Option B: copy into your global extensions folder (dev)
 
 ```bash
-mkdir -p ~/.clawdbot/extensions
-cp -R extensions/voice-call ~/.clawdbot/extensions/voice-call
-cd ~/.clawdbot/extensions/voice-call && pnpm install
+mkdir -p ~/.openclaw/extensions
+cp -R extensions/voice-call ~/.openclaw/extensions/voice-call
+cd ~/.openclaw/extensions/voice-call && pnpm install
 ```
 
 ## Config
@@ -34,19 +36,24 @@ Put under `plugins.entries.voice-call.config`:
 
 ```json5
 {
-  provider: "twilio", // or "telnyx" | "mock"
+  provider: "twilio", // or "telnyx" | "plivo" | "mock"
   fromNumber: "+15550001234",
   toNumber: "+15550005678",
 
   twilio: {
     accountSid: "ACxxxxxxxx",
-    authToken: "your_token"
+    authToken: "your_token",
+  },
+
+  plivo: {
+    authId: "MAxxxxxxxxxxxxxxxxxxxx",
+    authToken: "your_token",
   },
 
   // Webhook server
   serve: {
     port: 3334,
-    path: "/voice/webhook"
+    path: "/voice/webhook",
   },
 
   // Public exposure (pick one):
@@ -55,30 +62,54 @@ Put under `plugins.entries.voice-call.config`:
   // tailscale: { mode: "funnel", path: "/voice/webhook" }
 
   outbound: {
-    defaultMode: "notify" // or "conversation"
+    defaultMode: "notify", // or "conversation"
   },
 
   streaming: {
     enabled: true,
-    streamPath: "/voice/stream"
-  }
+    streamPath: "/voice/stream",
+  },
 }
 ```
 
 Notes:
-- Twilio/Telnyx require a **publicly reachable** webhook URL.
+
+- Twilio/Telnyx/Plivo require a **publicly reachable** webhook URL.
 - `mock` is a local dev provider (no network calls).
+- `tunnel.allowNgrokFreeTierLoopbackBypass: true` allows Twilio webhooks with invalid signatures **only** when `tunnel.provider="ngrok"` and `serve.bind` is loopback (ngrok local agent). Use for local dev only.
+
+## TTS for calls
+
+Voice Call uses the core `messages.tts` configuration (OpenAI or ElevenLabs) for
+streaming speech on calls. You can override it under the plugin config with the
+same shape — overrides deep-merge with `messages.tts`.
+
+```json5
+{
+  tts: {
+    provider: "openai",
+    openai: {
+      voice: "alloy",
+    },
+  },
+}
+```
+
+Notes:
+
+- Edge TTS is ignored for voice calls (telephony audio needs PCM; Edge output is unreliable).
+- Core TTS is used when Twilio media streaming is enabled; otherwise calls fall back to provider native voices.
 
 ## CLI
 
 ```bash
-clawdbot voicecall call --to "+15555550123" --message "Hello from Clawdbot"
-clawdbot voicecall continue --call-id <id> --message "Any questions?"
-clawdbot voicecall speak --call-id <id> --message "One moment"
-clawdbot voicecall end --call-id <id>
-clawdbot voicecall status --call-id <id>
-clawdbot voicecall tail
-clawdbot voicecall expose --mode funnel
+openclaw voicecall call --to "+15555550123" --message "Hello from OpenClaw"
+openclaw voicecall continue --call-id <id> --message "Any questions?"
+openclaw voicecall speak --call-id <id> --message "One moment"
+openclaw voicecall end --call-id <id>
+openclaw voicecall status --call-id <id>
+openclaw voicecall tail
+openclaw voicecall expose --mode funnel
 ```
 
 ## Tool
@@ -86,6 +117,7 @@ clawdbot voicecall expose --mode funnel
 Tool name: `voice_call`
 
 Actions:
+
 - `initiate_call` (message, to?, mode?)
 - `continue_call` (callId, message)
 - `speak_to_user` (callId, message)
@@ -102,6 +134,6 @@ Actions:
 
 ## Notes
 
-- Uses webhook signature verification for Twilio/Telnyx.
+- Uses webhook signature verification for Twilio/Telnyx/Plivo.
 - `responseModel` / `responseSystemPrompt` control AI auto-responses.
 - Media streaming requires `ws` and OpenAI Realtime API key.

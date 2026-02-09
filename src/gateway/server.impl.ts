@@ -1,27 +1,74 @@
-import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
-import { initSubagentRegistry } from "../agents/subagent-registry.js";
+import path from "node:path";
 import type { CanvasHostServer } from "../canvas-host/server.js";
+import type { PluginServicesHandle } from "../plugins/services.js";
+import type { RuntimeEnv } from "../runtime.js";
+import type { ControlUiRootState } from "./control-ui.js";
+import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { registerSkillsChangeListener } from "../agents/skills/refresh.js";
+import { initSubagentRegistry } from "../agents/subagent-registry.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
+import { formatCliCommand } from "../cli/command-format.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import {
-  CONFIG_PATH_CLAWDBOT,
+  CONFIG_PATH,
   isNixMode,
   loadConfig,
   migrateLegacyConfig,
   readConfigFileSnapshot,
   writeConfigFile,
 } from "../config/config.js";
+import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
 import { clearAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
+import {
+  ensureControlUiAssetsBuilt,
+  resolveControlUiRootOverrideSync,
+  resolveControlUiRootSync,
+} from "../infra/control-ui-assets.js";
+import { isDiagnosticsEnabled } from "../infra/diagnostic-events.js";
+import { logAcceptedEnvOption } from "../infra/env.js";
+import { createExecApprovalForwarder } from "../infra/exec-approval-forwarder.js";
 import { onHeartbeatEvent } from "../infra/heartbeat-events.js";
 import { startHeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
-import { ensureClawdbotCliOnPath } from "../infra/path-env.js";
-import { autoMigrateLegacyState } from "../infra/state-migrations.js";
-import { createSubsystemLogger, runtimeForLogger } from "../logging.js";
-import type { PluginServicesHandle } from "../plugins/services.js";
-import type { RuntimeEnv } from "../runtime.js";
+import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
+import { setGatewaySigusr1RestartPolicy } from "../infra/restart.js";
+import {
+  primeRemoteSkillsCache,
+  refreshRemoteBinsForConnectedNodes,
+  setSkillsRemoteRegistry,
+} from "../infra/skills-remote.js";
+import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
+import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
+import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
 import { startGatewayConfigReloader } from "./config-reload.js";
+import { ExecApprovalManager } from "./exec-approval-manager.js";
+import { NodeRegistry } from "./node-registry.js";
+import { createChannelManager } from "./server-channels.js";
+import { createAgentEventHandler } from "./server-chat.js";
+import { createGatewayCloseHandler } from "./server-close.js";
+import { buildGatewayCronService } from "./server-cron.js";
+import { startGatewayDiscovery } from "./server-discovery-runtime.js";
+import { applyGatewayLaneConcurrency } from "./server-lanes.js";
+import { startGatewayMaintenanceTimers } from "./server-maintenance.js";
+import { GATEWAY_EVENTS, listGatewayMethods } from "./server-methods-list.js";
+import { coreGatewayHandlers } from "./server-methods.js";
+import { createExecApprovalHandlers } from "./server-methods/exec-approval.js";
+import { safeParseJson } from "./server-methods/nodes.helpers.js";
+import { hasConnectedMobileNode } from "./server-mobile-nodes.js";
+import { loadGatewayModelCatalog } from "./server-model-catalog.js";
+import { createNodeSubscriptionManager } from "./server-node-subscriptions.js";
+import { loadGatewayPlugins } from "./server-plugins.js";
+import { createGatewayReloadHandlers } from "./server-reload-handlers.js";
+import { resolveGatewayRuntimeConfig } from "./server-runtime-config.js";
+import { createGatewayRuntimeState } from "./server-runtime-state.js";
+import { resolveSessionKeyForRun } from "./server-session-key.js";
+import { logGatewayStartup } from "./server-startup-log.js";
+import { startGatewaySidecars } from "./server-startup.js";
+import { startGatewayTailscaleExposure } from "./server-tailscale.js";
+import { createWizardSessionTracker } from "./server-wizard-sessions.js";
+import { attachGatewayWsHandlers } from "./server-ws-runtime.js";
 import {
   getHealthCache,
   getHealthVersion,
@@ -29,36 +76,14 @@ import {
   incrementPresenceVersion,
   refreshGatewayHealthSnapshot,
 } from "./server/health-state.js";
-import { startGatewayBridgeRuntime } from "./server-bridge-runtime.js";
-import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
-import { createChannelManager } from "./server-channels.js";
-import { createAgentEventHandler } from "./server-chat.js";
-import { createGatewayCloseHandler } from "./server-close.js";
-import { buildGatewayCronService } from "./server-cron.js";
-import { applyGatewayLaneConcurrency } from "./server-lanes.js";
-import { startGatewayMaintenanceTimers } from "./server-maintenance.js";
-import { coreGatewayHandlers } from "./server-methods.js";
-import { GATEWAY_EVENTS, listGatewayMethods } from "./server-methods-list.js";
-import { hasConnectedMobileNode as hasConnectedMobileNodeFromBridge } from "./server-mobile-nodes.js";
-import { loadGatewayModelCatalog } from "./server-model-catalog.js";
-import { loadGatewayPlugins } from "./server-plugins.js";
-import { createGatewayReloadHandlers } from "./server-reload-handlers.js";
-import { resolveGatewayRuntimeConfig } from "./server-runtime-config.js";
-import { createGatewayRuntimeState } from "./server-runtime-state.js";
-import { resolveSessionKeyForRun } from "./server-session-key.js";
-import { startGatewaySidecars } from "./server-startup.js";
-import { logGatewayStartup } from "./server-startup-log.js";
-import { startGatewayTailscaleExposure } from "./server-tailscale.js";
-import { createWizardSessionTracker } from "./server-wizard-sessions.js";
-import { attachGatewayWsHandlers } from "./server-ws-runtime.js";
+import { loadGatewayTlsRuntime } from "./server/tls.js";
 
 export { __resetModelCatalogCacheForTest } from "./server-model-catalog.js";
 
-ensureClawdbotCliOnPath();
+ensureOpenClawCliOnPath();
 
 const log = createSubsystemLogger("gateway");
 const logCanvas = log.child("canvas");
-const logBridge = log.child("bridge");
 const logDiscovery = log.child("discovery");
 const logTailscale = log.child("tailscale");
 const logChannels = log.child("channels");
@@ -69,6 +94,7 @@ const logReload = log.child("reload");
 const logHooks = log.child("hooks");
 const logPlugins = log.child("plugins");
 const logWsControl = log.child("ws");
+const gatewayRuntime = runtimeForLogger(log);
 const canvasRuntime = runtimeForLogger(logCanvas);
 
 export type GatewayServer = {
@@ -81,9 +107,9 @@ export type GatewayServerOptions = {
    * - loopback: 127.0.0.1
    * - lan: 0.0.0.0
    * - tailnet: bind only to the Tailscale IPv4 address (100.64.0.0/10)
-   * - auto: prefer tailnet, else LAN
+   * - auto: prefer loopback, else LAN
    */
-  bind?: import("../config/config.js").BridgeBindMode;
+  bind?: import("../config/config.js").GatewayBindMode;
   /**
    * Advanced override for the bind host, bypassing bind resolution.
    * Prefer `bind` unless you really need a specific address.
@@ -99,6 +125,11 @@ export type GatewayServerOptions = {
    * Default: config `gateway.http.endpoints.chatCompletions.enabled` (or false when absent).
    */
   openAiChatCompletionsEnabled?: boolean;
+  /**
+   * If false, do not serve `POST /v1/responses` (OpenResponses API).
+   * Default: config `gateway.http.endpoints.responses.enabled` (or false when absent).
+   */
+  openResponsesEnabled?: boolean;
   /**
    * Override gateway auth configuration (merges with config).
    */
@@ -125,10 +156,18 @@ export async function startGatewayServer(
   port = 18789,
   opts: GatewayServerOptions = {},
 ): Promise<GatewayServer> {
-  // Ensure all default port derivations (browser/bridge/canvas) see the actual runtime port.
-  process.env.CLAWDBOT_GATEWAY_PORT = String(port);
+  // Ensure all default port derivations (browser/canvas) see the actual runtime port.
+  process.env.OPENCLAW_GATEWAY_PORT = String(port);
+  logAcceptedEnvOption({
+    key: "OPENCLAW_RAW_STREAM",
+    description: "raw stream logging enabled",
+  });
+  logAcceptedEnvOption({
+    key: "OPENCLAW_RAW_STREAM_PATH",
+    description: "raw stream log path override",
+  });
 
-  const configSnapshot = await readConfigFileSnapshot();
+  let configSnapshot = await readConfigFileSnapshot();
   if (configSnapshot.legacyIssues.length > 0) {
     if (isNixMode) {
       throw new Error(
@@ -138,7 +177,7 @@ export async function startGatewayServer(
     const { config: migrated, changes } = migrateLegacyConfig(configSnapshot.parsed);
     if (!migrated) {
       throw new Error(
-        'Legacy config entries detected but auto-migration failed. Run "clawdbot doctor" to migrate.',
+        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("openclaw doctor")}" to migrate.`,
       );
     }
     await writeConfigFile(migrated);
@@ -151,9 +190,40 @@ export async function startGatewayServer(
     }
   }
 
+  configSnapshot = await readConfigFileSnapshot();
+  if (configSnapshot.exists && !configSnapshot.valid) {
+    const issues =
+      configSnapshot.issues.length > 0
+        ? configSnapshot.issues
+            .map((issue) => `${issue.path || "<root>"}: ${issue.message}`)
+            .join("\n")
+        : "Unknown validation issue.";
+    throw new Error(
+      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`,
+    );
+  }
+
+  const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
+  if (autoEnable.changes.length > 0) {
+    try {
+      await writeConfigFile(autoEnable.config);
+      log.info(
+        `gateway: auto-enabled plugins:\n${autoEnable.changes
+          .map((entry) => `- ${entry}`)
+          .join("\n")}`,
+      );
+    } catch (err) {
+      log.warn(`gateway: failed to persist plugin auto-enable changes: ${String(err)}`);
+    }
+  }
+
   const cfgAtStart = loadConfig();
+  const diagnosticsEnabled = isDiagnosticsEnabled(cfgAtStart);
+  if (diagnosticsEnabled) {
+    startDiagnosticHeartbeat();
+  }
+  setGatewaySigusr1RestartPolicy({ allowExternal: cfgAtStart.commands?.restart === true });
   initSubagentRegistry();
-  await autoMigrateLegacyState({ cfg: cfgAtStart, log });
   const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
   const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
   const baseMethods = listGatewayMethods();
@@ -180,6 +250,7 @@ export async function startGatewayServer(
     host: opts.host,
     controlUiEnabled: opts.controlUiEnabled,
     openAiChatCompletionsEnabled: opts.openAiChatCompletionsEnabled,
+    openResponsesEnabled: opts.openResponsesEnabled,
     auth: opts.auth,
     tailscale: opts.tailscale,
   });
@@ -187,7 +258,10 @@ export async function startGatewayServer(
     bindHost,
     controlUiEnabled,
     openAiChatCompletionsEnabled,
+    openResponsesEnabled,
+    openResponsesConfig,
     controlUiBasePath,
+    controlUiRoot: controlUiRootOverride,
     resolvedAuth,
     tailscaleConfig,
     tailscaleMode,
@@ -195,17 +269,56 @@ export async function startGatewayServer(
   let hooksConfig = runtimeConfig.hooksConfig;
   const canvasHostEnabled = runtimeConfig.canvasHostEnabled;
 
+  let controlUiRootState: ControlUiRootState | undefined;
+  if (controlUiRootOverride) {
+    const resolvedOverride = resolveControlUiRootOverrideSync(controlUiRootOverride);
+    const resolvedOverridePath = path.resolve(controlUiRootOverride);
+    controlUiRootState = resolvedOverride
+      ? { kind: "resolved", path: resolvedOverride }
+      : { kind: "invalid", path: resolvedOverridePath };
+    if (!resolvedOverride) {
+      log.warn(`gateway: controlUi.root not found at ${resolvedOverridePath}`);
+    }
+  } else if (controlUiEnabled) {
+    let resolvedRoot = resolveControlUiRootSync({
+      moduleUrl: import.meta.url,
+      argv1: process.argv[1],
+      cwd: process.cwd(),
+    });
+    if (!resolvedRoot) {
+      const ensureResult = await ensureControlUiAssetsBuilt(gatewayRuntime);
+      if (!ensureResult.ok && ensureResult.message) {
+        log.warn(`gateway: ${ensureResult.message}`);
+      }
+      resolvedRoot = resolveControlUiRootSync({
+        moduleUrl: import.meta.url,
+        argv1: process.argv[1],
+        cwd: process.cwd(),
+      });
+    }
+    controlUiRootState = resolvedRoot
+      ? { kind: "resolved", path: resolvedRoot }
+      : { kind: "missing" };
+  }
+
   const wizardRunner = opts.wizardRunner ?? runOnboardingWizard;
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
 
   const deps = createDefaultDeps();
   let canvasHostServer: CanvasHostServer | null = null;
+  const gatewayTls = await loadGatewayTlsRuntime(cfgAtStart.gateway?.tls, log.child("tls"));
+  if (cfgAtStart.gateway?.tls?.enabled && !gatewayTls.enabled) {
+    throw new Error(gatewayTls.error ?? "gateway tls: failed to enable");
+  }
   const {
     canvasHost,
     httpServer,
+    httpServers,
+    httpBindHosts,
     wss,
     clients,
     broadcast,
+    broadcastToConnIds,
     agentRunSeq,
     dedupe,
     chatRunState,
@@ -214,14 +327,19 @@ export async function startGatewayServer(
     addChatRun,
     removeChatRun,
     chatAbortControllers,
+    toolEventRecipients,
   } = await createGatewayRuntimeState({
     cfg: cfgAtStart,
     bindHost,
     port,
     controlUiEnabled,
     controlUiBasePath,
+    controlUiRoot: controlUiRootState,
     openAiChatCompletionsEnabled,
+    openResponsesEnabled,
+    openResponsesConfig,
     resolvedAuth,
+    gatewayTls,
     hooksConfig: () => hooksConfig,
     pluginRegistry,
     deps,
@@ -229,13 +347,29 @@ export async function startGatewayServer(
     canvasHostEnabled,
     allowCanvasHostInTests: opts.allowCanvasHostInTests,
     logCanvas,
+    log,
     logHooks,
     logPlugins,
   });
   let bonjourStop: (() => Promise<void>) | null = null;
-  let bridge: import("../infra/bridge/server.js").NodeBridgeServer | null = null;
-
-  const hasConnectedMobileNode = () => hasConnectedMobileNodeFromBridge(bridge);
+  const nodeRegistry = new NodeRegistry();
+  const nodePresenceTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const nodeSubscriptions = createNodeSubscriptionManager();
+  const nodeSendEvent = (opts: { nodeId: string; event: string; payloadJSON?: string | null }) => {
+    const payload = safeParseJson(opts.payloadJSON ?? null);
+    nodeRegistry.sendEvent(opts.nodeId, opts.event, payload);
+  };
+  const nodeSendToSession = (sessionKey: string, event: string, payload: unknown) =>
+    nodeSubscriptions.sendToSession(sessionKey, event, payload, nodeSendEvent);
+  const nodeSendToAllSubscribed = (event: string, payload: unknown) =>
+    nodeSubscriptions.sendToAllSubscribed(event, payload, nodeSendEvent);
+  const nodeSubscribe = nodeSubscriptions.subscribe;
+  const nodeUnsubscribe = nodeSubscriptions.unsubscribe;
+  const nodeUnsubscribeAll = nodeSubscriptions.unsubscribeAll;
+  const broadcastVoiceWakeChanged = (triggers: string[]) => {
+    broadcast("voicewake.changed", { triggers }, { dropIfSlow: true });
+  };
+  const hasMobileNodeConnected = () => hasConnectedMobileNode(nodeRegistry);
   applyGatewayLaneConcurrency(cfgAtStart);
 
   let cronState = buildGatewayCronService({
@@ -254,43 +388,44 @@ export async function startGatewayServer(
     channelManager;
 
   const machineDisplayName = await getMachineDisplayName();
-  const bridgeRuntime = await startGatewayBridgeRuntime({
-    cfg: cfgAtStart,
-    port,
-    canvasHostEnabled,
-    canvasHost,
-    canvasRuntime,
-    allowCanvasHostInTests: opts.allowCanvasHostInTests,
+  const discovery = await startGatewayDiscovery({
     machineDisplayName,
-    deps,
-    broadcast,
-    dedupe,
-    agentRunSeq,
-    chatRunState,
-    chatRunBuffers,
-    chatDeltaSentAt,
-    addChatRun,
-    removeChatRun,
-    chatAbortControllers,
-    getHealthCache,
-    refreshGatewayHealthSnapshot,
-    loadGatewayModelCatalog,
-    logBridge,
-    logCanvas,
+    port,
+    gatewayTls: gatewayTls.enabled
+      ? { enabled: true, fingerprintSha256: gatewayTls.fingerprintSha256 }
+      : undefined,
+    wideAreaDiscoveryEnabled: cfgAtStart.discovery?.wideArea?.enabled === true,
+    wideAreaDiscoveryDomain: cfgAtStart.discovery?.wideArea?.domain,
+    tailscaleMode,
+    mdnsMode: cfgAtStart.discovery?.mdns?.mode,
     logDiscovery,
   });
-  bridge = bridgeRuntime.bridge;
-  const bridgeHost = bridgeRuntime.bridgeHost;
-  canvasHostServer = bridgeRuntime.canvasHostServer;
-  const nodePresenceTimers = bridgeRuntime.nodePresenceTimers;
-  bonjourStop = bridgeRuntime.bonjourStop;
-  const bridgeSendToSession = bridgeRuntime.bridgeSendToSession;
-  const bridgeSendToAllSubscribed = bridgeRuntime.bridgeSendToAllSubscribed;
-  const broadcastVoiceWakeChanged = bridgeRuntime.broadcastVoiceWakeChanged;
+  bonjourStop = discovery.bonjourStop;
+
+  setSkillsRemoteRegistry(nodeRegistry);
+  void primeRemoteSkillsCache();
+  // Debounce skills-triggered node probes to avoid feedback loops and rapid-fire invokes.
+  // Skills changes can happen in bursts (e.g., file watcher events), and each probe
+  // takes time to complete. A 30-second delay ensures we batch changes together.
+  let skillsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const skillsRefreshDelayMs = 30_000;
+  const skillsChangeUnsub = registerSkillsChangeListener((event) => {
+    if (event.reason === "remote-node") {
+      return;
+    }
+    if (skillsRefreshTimer) {
+      clearTimeout(skillsRefreshTimer);
+    }
+    skillsRefreshTimer = setTimeout(() => {
+      skillsRefreshTimer = null;
+      const latest = loadConfig();
+      void refreshRemoteBinsForConnectedNodes(latest);
+    }, skillsRefreshDelayMs);
+  });
 
   const { tickInterval, healthInterval, dedupeCleanup } = startGatewayMaintenanceTimers({
     broadcast,
-    bridgeSendToAllSubscribed,
+    nodeSendToAllSubscribed,
     getPresenceVersion,
     getHealthVersion,
     refreshGatewayHealthSnapshot,
@@ -302,17 +437,19 @@ export async function startGatewayServer(
     chatDeltaSentAt,
     removeChatRun,
     agentRunSeq,
-    bridgeSendToSession,
+    nodeSendToSession,
   });
 
   const agentUnsub = onAgentEvent(
     createAgentEventHandler({
       broadcast,
-      bridgeSendToSession,
+      broadcastToConnIds,
+      nodeSendToSession,
       agentRunSeq,
       chatRunState,
       resolveSessionKeyForRun,
       clearAgentRunContext,
+      toolEventRecipients,
     }),
   );
 
@@ -324,20 +461,31 @@ export async function startGatewayServer(
 
   void cron.start().catch((err) => logCron.error(`failed to start: ${String(err)}`));
 
+  const execApprovalManager = new ExecApprovalManager();
+  const execApprovalForwarder = createExecApprovalForwarder();
+  const execApprovalHandlers = createExecApprovalHandlers(execApprovalManager, {
+    forwarder: execApprovalForwarder,
+  });
+
+  const canvasHostServerPort = (canvasHostServer as CanvasHostServer | null)?.port;
+
   attachGatewayWsHandlers({
     wss,
     clients,
     port,
-    bridgeHost: bridgeHost ?? undefined,
+    gatewayHost: bindHost ?? undefined,
     canvasHostEnabled: Boolean(canvasHost),
-    canvasHostServerPort: canvasHostServer?.port ?? undefined,
+    canvasHostServerPort,
     resolvedAuth,
     gatewayMethods,
     events: GATEWAY_EVENTS,
     logGateway: log,
     logHealth,
     logWsControl,
-    extraHandlers: pluginRegistry.gatewayHandlers,
+    extraHandlers: {
+      ...pluginRegistry.gatewayHandlers,
+      ...execApprovalHandlers,
+    },
     broadcast,
     context: {
       deps,
@@ -351,9 +499,14 @@ export async function startGatewayServer(
       incrementPresenceVersion,
       getHealthVersion,
       broadcast,
-      bridge,
-      bridgeSendToSession,
-      hasConnectedMobileNode,
+      broadcastToConnIds,
+      nodeSendToSession,
+      nodeSendToAllSubscribed,
+      nodeSubscribe,
+      nodeUnsubscribe,
+      nodeUnsubscribeAll,
+      hasConnectedMobileNode: hasMobileNodeConnected,
+      nodeRegistry,
       agentRunSeq,
       chatAbortControllers,
       chatAbortedRuns: chatRunState.abortedRuns,
@@ -361,6 +514,7 @@ export async function startGatewayServer(
       chatDeltaSentAt: chatRunState.deltaSentAt,
       addChatRun,
       removeChatRun,
+      registerToolEventRecipient: toolEventRecipients.add,
       dedupe,
       wizardSessions,
       findRunningWizard,
@@ -376,10 +530,13 @@ export async function startGatewayServer(
   logGatewayStartup({
     cfg: cfgAtStart,
     bindHost,
+    bindHosts: httpBindHosts,
     port,
+    tlsEnabled: gatewayTls.enabled,
     log,
     isNixMode,
   });
+  scheduleGatewayUpdateCheck({ cfg: cfgAtStart, log, isNixMode });
   const tailscaleCleanup = await startGatewayTailscaleExposure({
     tailscaleMode,
     resetOnExit: tailscaleConfig.resetOnExit,
@@ -437,7 +594,7 @@ export async function startGatewayServer(
       warn: (msg) => logReload.warn(msg),
       error: (msg) => logReload.error(msg),
     },
-    watchPath: CONFIG_PATH_CLAWDBOT,
+    watchPath: CONFIG_PATH,
   });
 
   const close = createGatewayCloseHandler({
@@ -445,7 +602,6 @@ export async function startGatewayServer(
     tailscaleCleanup,
     canvasHost,
     canvasHostServer,
-    bridge,
     stopChannel,
     pluginServices,
     cron,
@@ -463,7 +619,20 @@ export async function startGatewayServer(
     browserControl,
     wss,
     httpServer,
+    httpServers,
   });
 
-  return { close };
+  return {
+    close: async (opts) => {
+      if (diagnosticsEnabled) {
+        stopDiagnosticHeartbeat();
+      }
+      if (skillsRefreshTimer) {
+        clearTimeout(skillsRefreshTimer);
+        skillsRefreshTimer = null;
+      }
+      skillsChangeUnsub();
+      await close(opts);
+    },
+  };
 }

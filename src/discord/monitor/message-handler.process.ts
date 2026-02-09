@@ -1,27 +1,38 @@
-import {
-  resolveAckReaction,
-  resolveEffectiveMessagesConfig,
-  resolveHumanDelayConfig,
-  resolveIdentityName,
-} from "../../agents/identity.js";
-import {
-  extractShortModelName,
-  type ResponsePrefixContext,
-} from "../../auto-reply/reply/response-prefix-template.js";
-import { formatAgentEnvelope, formatThreadStarterEnvelope } from "../../auto-reply/envelope.js";
-import { dispatchReplyFromConfig } from "../../auto-reply/reply/dispatch-from-config.js";
-import { buildHistoryContextFromMap, clearHistoryEntries } from "../../auto-reply/reply/history.js";
-import { createReplyDispatcherWithTyping } from "../../auto-reply/reply/reply-dispatcher.js";
+import { ChannelType } from "@buape/carbon";
 import type { ReplyPayload } from "../../auto-reply/types.js";
-import { resolveStorePath, updateLastRoute } from "../../config/sessions.js";
+import type { DiscordMessagePreflightContext } from "./message-handler.preflight.js";
+import { resolveAckReaction, resolveHumanDelayConfig } from "../../agents/identity.js";
+import { resolveChunkMode } from "../../auto-reply/chunk.js";
+import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
+import {
+  formatInboundEnvelope,
+  formatThreadStarterEnvelope,
+  resolveEnvelopeFormatOptions,
+} from "../../auto-reply/envelope.js";
+import {
+  buildPendingHistoryContextFromMap,
+  clearHistoryEntriesIfEnabled,
+} from "../../auto-reply/reply/history.js";
+import { finalizeInboundContext } from "../../auto-reply/reply/inbound-context.js";
+import { createReplyDispatcherWithTyping } from "../../auto-reply/reply/reply-dispatcher.js";
+import {
+  removeAckReactionAfterReply,
+  shouldAckReaction as shouldAckReactionGate,
+} from "../../channels/ack-reactions.js";
+import { logTypingFailure, logAckFailure } from "../../channels/logging.js";
+import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
+import { recordInboundSession } from "../../channels/session.js";
+import { createTypingCallbacks } from "../../channels/typing.js";
+import { resolveMarkdownTableMode } from "../../config/markdown-tables.js";
+import { readSessionUpdatedAt, resolveStorePath } from "../../config/sessions.js";
 import { danger, logVerbose, shouldLogVerbose } from "../../globals.js";
 import { buildAgentSessionKey } from "../../routing/resolve-route.js";
 import { resolveThreadSessionKeys } from "../../routing/session-key.js";
+import { buildUntrustedChannelMetadata } from "../../security/channel-metadata.js";
 import { truncateUtf16Safe } from "../../utils.js";
 import { reactMessageDiscord, removeReactionDiscord } from "../send.js";
-import { normalizeDiscordSlug } from "./allow-list.js";
-import { formatDiscordUserTag, resolveTimestampMs } from "./format.js";
-import type { DiscordMessagePreflightContext } from "./message-handler.preflight.js";
+import { normalizeDiscordSlug, resolveDiscordOwnerAllowFrom } from "./allow-list.js";
+import { resolveTimestampMs } from "./format.js";
 import {
   buildDiscordMediaPayload,
   resolveDiscordMessageText,
@@ -47,6 +58,7 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     ackReactionScope,
     message,
     author,
+    sender,
     data,
     client,
     channelInfo,
@@ -56,12 +68,10 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     isGroupDm,
     baseText,
     messageText,
-    wasMentioned,
     shouldRequireMention,
     canDetectMention,
-    shouldBypassMention,
     effectiveWasMentioned,
-    historyEntry,
+    shouldBypassMention,
     threadChannel,
     threadParentId,
     threadParentName,
@@ -84,20 +94,20 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
   }
   const ackReaction = resolveAckReaction(cfg, route.agentId);
   const removeAckAfterReply = cfg.messages?.removeAckAfterReply ?? false;
-  const shouldAckReaction = () => {
-    if (!ackReaction) return false;
-    if (ackReactionScope === "all") return true;
-    if (ackReactionScope === "direct") return isDirectMessage;
-    const isGroupChat = isGuildMessage || isGroupDm;
-    if (ackReactionScope === "group-all") return isGroupChat;
-    if (ackReactionScope === "group-mentions") {
-      if (!isGuildMessage) return false;
-      if (!shouldRequireMention) return false;
-      if (!canDetectMention) return false;
-      return wasMentioned || shouldBypassMention;
-    }
-    return false;
-  };
+  const shouldAckReaction = () =>
+    Boolean(
+      ackReaction &&
+      shouldAckReactionGate({
+        scope: ackReactionScope,
+        isDirect: isDirectMessage,
+        isGroup: isGuildMessage || isGroupDm,
+        isMentionableGroup: isGuildMessage,
+        requireMention: Boolean(shouldRequireMention),
+        canDetectMention,
+        effectiveWasMentioned,
+        shouldBypassMention,
+      }),
+    );
   const ackReactionPromise = shouldAckReaction()
     ? reactMessageDiscord(message.channelId, message.id, ackReaction, {
         rest: client.rest,
@@ -117,70 +127,112 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
         channelName: channelName ?? message.channelId,
         channelId: message.channelId,
       });
-  const groupRoom = isGuildMessage && displayChannelSlug ? `#${displayChannelSlug}` : undefined;
-  const groupSubject = isDirectMessage ? undefined : groupRoom;
-  const channelDescription = channelInfo?.topic?.trim();
-  const systemPromptParts = [
-    channelDescription ? `Channel topic: ${channelDescription}` : null,
-    channelConfig?.systemPrompt?.trim() || null,
-  ].filter((entry): entry is string => Boolean(entry));
+  const senderLabel = sender.label;
+  const isForumParent =
+    threadParentType === ChannelType.GuildForum || threadParentType === ChannelType.GuildMedia;
+  const forumParentSlug =
+    isForumParent && threadParentName ? normalizeDiscordSlug(threadParentName) : "";
+  const threadChannelId = threadChannel?.id;
+  const isForumStarter =
+    Boolean(threadChannelId && isForumParent && forumParentSlug) && message.id === threadChannelId;
+  const forumContextLine = isForumStarter ? `[Forum parent: #${forumParentSlug}]` : null;
+  const groupChannel = isGuildMessage && displayChannelSlug ? `#${displayChannelSlug}` : undefined;
+  const groupSubject = isDirectMessage ? undefined : groupChannel;
+  const untrustedChannelMetadata = isGuildMessage
+    ? buildUntrustedChannelMetadata({
+        source: "discord",
+        label: "Discord channel topic",
+        entries: [channelInfo?.topic],
+      })
+    : undefined;
+  const senderName = sender.isPluralKit
+    ? (sender.name ?? author.username)
+    : (data.member?.nickname ?? author.globalName ?? author.username);
+  const senderUsername = sender.isPluralKit
+    ? (sender.tag ?? sender.name ?? author.username)
+    : author.username;
+  const senderTag = sender.tag;
+  const systemPromptParts = [channelConfig?.systemPrompt?.trim() || null].filter(
+    (entry): entry is string => Boolean(entry),
+  );
   const groupSystemPrompt =
     systemPromptParts.length > 0 ? systemPromptParts.join("\n\n") : undefined;
-  let combinedBody = formatAgentEnvelope({
+  const ownerAllowFrom = resolveDiscordOwnerAllowFrom({
+    channelConfig,
+    guildInfo,
+    sender: { id: sender.id, name: sender.name, tag: sender.tag },
+  });
+  const storePath = resolveStorePath(cfg.session?.store, {
+    agentId: route.agentId,
+  });
+  const envelopeOptions = resolveEnvelopeFormatOptions(cfg);
+  const previousTimestamp = readSessionUpdatedAt({
+    storePath,
+    sessionKey: route.sessionKey,
+  });
+  let combinedBody = formatInboundEnvelope({
     channel: "Discord",
     from: fromLabel,
     timestamp: resolveTimestampMs(message.timestamp),
     body: text,
+    chatType: isDirectMessage ? "direct" : "channel",
+    senderLabel,
+    previousTimestamp,
+    envelope: envelopeOptions,
   });
-  let shouldClearHistory = false;
   const shouldIncludeChannelHistory =
     !isDirectMessage && !(isGuildMessage && channelConfig?.autoThread && !threadChannel);
   if (shouldIncludeChannelHistory) {
-    combinedBody = buildHistoryContextFromMap({
+    combinedBody = buildPendingHistoryContextFromMap({
       historyMap: guildHistories,
       historyKey: message.channelId,
       limit: historyLimit,
-      entry: historyEntry,
       currentMessage: combinedBody,
       formatEntry: (entry) =>
-        formatAgentEnvelope({
+        formatInboundEnvelope({
           channel: "Discord",
           from: fromLabel,
           timestamp: entry.timestamp,
-          body: `${entry.sender}: ${entry.body} [id:${entry.messageId ?? "unknown"} channel:${message.channelId}]`,
+          body: `${entry.body} [id:${entry.messageId ?? "unknown"} channel:${message.channelId}]`,
+          chatType: "channel",
+          senderLabel: entry.sender,
+          envelope: envelopeOptions,
         }),
     });
-    shouldClearHistory = true;
   }
-  if (!isDirectMessage) {
-    const name = formatDiscordUserTag(author);
-    const id = author.id;
-    combinedBody = `${combinedBody}\n[from: ${name} user id:${id}]`;
-  }
-  const replyContext = resolveReplyContext(message, resolveDiscordMessageText);
+  const replyContext = resolveReplyContext(message, resolveDiscordMessageText, {
+    envelope: envelopeOptions,
+  });
   if (replyContext) {
     combinedBody = `[Replied message - for context]\n${replyContext}\n\n${combinedBody}`;
+  }
+  if (forumContextLine) {
+    combinedBody = `${combinedBody}\n${forumContextLine}`;
   }
 
   let threadStarterBody: string | undefined;
   let threadLabel: string | undefined;
   let parentSessionKey: string | undefined;
   if (threadChannel) {
-    const starter = await resolveDiscordThreadStarter({
-      channel: threadChannel,
-      client,
-      parentId: threadParentId,
-      parentType: threadParentType,
-      resolveTimestampMs,
-    });
-    if (starter?.text) {
-      const starterEnvelope = formatThreadStarterEnvelope({
-        channel: "Discord",
-        author: starter.author,
-        timestamp: starter.timestamp,
-        body: starter.text,
+    const includeThreadStarter = channelConfig?.includeThreadStarter !== false;
+    if (includeThreadStarter) {
+      const starter = await resolveDiscordThreadStarter({
+        channel: threadChannel,
+        client,
+        parentId: threadParentId,
+        parentType: threadParentType,
+        resolveTimestampMs,
       });
-      threadStarterBody = starterEnvelope;
+      if (starter?.text) {
+        const starterEnvelope = formatThreadStarterEnvelope({
+          channel: "Discord",
+          author: starter.author,
+          timestamp: starter.timestamp,
+          body: starter.text,
+          envelope: envelopeOptions,
+        });
+        threadStarterBody = starterEnvelope;
+      }
     }
     const parentName = threadParentName ?? "parent";
     threadLabel = threadName
@@ -220,14 +272,14 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
 
   const effectiveFrom = isDirectMessage
     ? `discord:${author.id}`
-    : (autoThreadContext?.From ?? `group:${message.channelId}`);
+    : (autoThreadContext?.From ?? `discord:channel:${message.channelId}`);
   const effectiveTo = autoThreadContext?.To ?? replyTarget;
   if (!effectiveTo) {
     runtime.error?.(danger("discord: missing reply target"));
     return;
   }
 
-  const ctxPayload = {
+  const ctxPayload = finalizeInboundContext({
     Body: combinedBody,
     RawBody: baseText,
     CommandBody: baseText,
@@ -235,15 +287,18 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     To: effectiveTo,
     SessionKey: autoThreadContext?.SessionKey ?? threadKeys.sessionKey,
     AccountId: route.accountId,
-    ChatType: isDirectMessage ? "direct" : "group",
-    SenderName: data.member?.nickname ?? author.globalName ?? author.username,
-    SenderId: author.id,
-    SenderUsername: author.username,
-    SenderTag: formatDiscordUserTag(author),
+    ChatType: isDirectMessage ? "direct" : "channel",
+    ConversationLabel: fromLabel,
+    SenderName: senderName,
+    SenderId: sender.id,
+    SenderUsername: senderUsername,
+    SenderTag: senderTag,
     GroupSubject: groupSubject,
-    GroupRoom: groupRoom,
+    GroupChannel: groupChannel,
+    UntrustedContext: untrustedChannelMetadata ? [untrustedChannelMetadata] : undefined,
     GroupSystemPrompt: isGuildMessage ? groupSystemPrompt : undefined,
     GroupSpace: isGuildMessage ? (guildInfo?.id ?? guildSlug) || undefined : undefined,
+    OwnerAllowFrom: ownerAllowFrom,
     Provider: "discord" as const,
     Surface: "discord" as const,
     WasMentioned: effectiveWasMentioned,
@@ -258,21 +313,24 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     // Originating channel for reply routing.
     OriginatingChannel: "discord" as const,
     OriginatingTo: autoThreadContext?.OriginatingTo ?? replyTarget,
-  };
+  });
 
-  if (isDirectMessage) {
-    const sessionCfg = cfg.session;
-    const storePath = resolveStorePath(sessionCfg?.store, {
-      agentId: route.agentId,
-    });
-    await updateLastRoute({
-      storePath,
-      sessionKey: route.mainSessionKey,
-      channel: "discord",
-      to: `user:${author.id}`,
-      accountId: route.accountId,
-    });
-  }
+  await recordInboundSession({
+    storePath,
+    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    ctx: ctxPayload,
+    updateLastRoute: isDirectMessage
+      ? {
+          sessionKey: route.mainSessionKey,
+          channel: "discord",
+          to: `user:${author.id}`,
+          accountId: route.accountId,
+        }
+      : undefined,
+    onRecordError: (err) => {
+      logVerbose(`discord: failed updating session meta: ${String(err)}`);
+    },
+  });
 
   if (shouldLogVerbose()) {
     const preview = truncateUtf16Safe(combinedBody, 200).replace(/\n/g, "\\n");
@@ -281,19 +339,24 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     );
   }
 
-  let didSendReply = false;
   const typingChannelId = deliverTarget.startsWith("channel:")
     ? deliverTarget.slice("channel:".length)
     : message.channelId;
 
-  // Create mutable context for response prefix template interpolation
-  let prefixContext: ResponsePrefixContext = {
-    identityName: resolveIdentityName(cfg, route.agentId),
-  };
+  const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
+    cfg,
+    agentId: route.agentId,
+    channel: "discord",
+    accountId: route.accountId,
+  });
+  const tableMode = resolveMarkdownTableMode({
+    cfg,
+    channel: "discord",
+    accountId,
+  });
 
   const { dispatcher, replyOptions, markDispatchIdle } = createReplyDispatcherWithTyping({
-    responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId).responsePrefix,
-    responsePrefixContextProvider: () => prefixContext,
+    ...prefixOptions,
     humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
     deliver: async (payload: ReplyPayload) => {
       const replyToId = replyReference.use();
@@ -307,17 +370,28 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
         replyToId,
         textLimit,
         maxLinesPerMessage: discordConfig?.maxLinesPerMessage,
+        tableMode,
+        chunkMode: resolveChunkMode(cfg, "discord", accountId),
       });
-      didSendReply = true;
       replyReference.markSent();
     },
     onError: (err, info) => {
       runtime.error?.(danger(`discord ${info.kind} reply failed: ${String(err)}`));
     },
-    onReplyStart: () => sendTyping({ client, channelId: typingChannelId }),
+    onReplyStart: createTypingCallbacks({
+      start: () => sendTyping({ client, channelId: typingChannelId }),
+      onStartError: (err) => {
+        logTypingFailure({
+          log: logVerbose,
+          channel: "discord",
+          target: typingChannelId,
+          error: err,
+        });
+      },
+    }).onReplyStart,
   });
 
-  const { queuedFinal, counts } = await dispatchReplyFromConfig({
+  const { queuedFinal, counts } = await dispatchInboundMessage({
     ctx: ctxPayload,
     cfg,
     dispatcher,
@@ -328,49 +402,49 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
         typeof discordConfig?.blockStreaming === "boolean"
           ? !discordConfig.blockStreaming
           : undefined,
-      onModelSelected: (ctx) => {
-        // Mutate the object directly instead of reassigning to ensure the closure sees updates
-        prefixContext.provider = ctx.provider;
-        prefixContext.model = extractShortModelName(ctx.model);
-        prefixContext.modelFull = `${ctx.provider}/${ctx.model}`;
-        prefixContext.thinkingLevel = ctx.thinkLevel ?? "off";
-      },
+      onModelSelected,
     },
   });
   markDispatchIdle();
   if (!queuedFinal) {
-    if (isGuildMessage && shouldClearHistory && historyLimit > 0 && didSendReply) {
-      clearHistoryEntries({
+    if (isGuildMessage) {
+      clearHistoryEntriesIfEnabled({
         historyMap: guildHistories,
         historyKey: message.channelId,
+        limit: historyLimit,
       });
     }
     return;
   }
-  didSendReply = true;
   if (shouldLogVerbose()) {
     const finalCount = counts.final;
     logVerbose(
       `discord: delivered ${finalCount} reply${finalCount === 1 ? "" : "ies"} to ${replyTarget}`,
     );
   }
-  if (removeAckAfterReply && ackReactionPromise && ackReaction) {
-    const ackReactionValue = ackReaction;
-    void ackReactionPromise.then((didAck) => {
-      if (!didAck) return;
-      removeReactionDiscord(message.channelId, message.id, ackReactionValue, {
+  removeAckReactionAfterReply({
+    removeAfterReply: removeAckAfterReply,
+    ackReactionPromise,
+    ackReactionValue: ackReaction,
+    remove: async () => {
+      await removeReactionDiscord(message.channelId, message.id, ackReaction, {
         rest: client.rest,
-      }).catch((err) => {
-        logVerbose(
-          `discord: failed to remove ack reaction from ${message.channelId}/${message.id}: ${String(err)}`,
-        );
       });
-    });
-  }
-  if (isGuildMessage && shouldClearHistory && historyLimit > 0 && didSendReply) {
-    clearHistoryEntries({
+    },
+    onError: (err) => {
+      logAckFailure({
+        log: logVerbose,
+        channel: "discord",
+        target: `${message.channelId}/${message.id}`,
+        error: err,
+      });
+    },
+  });
+  if (isGuildMessage) {
+    clearHistoryEntriesIfEnabled({
       historyMap: guildHistories,
       historyKey: message.channelId,
+      limit: historyLimit,
     });
   }
 }

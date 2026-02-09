@@ -1,131 +1,30 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
 import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
 import { resetInboundDedupe } from "../auto-reply/reply/inbound-dedupe.js";
 import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
-import { monitorSlackProvider } from "./monitor.js";
+import {
+  defaultSlackTestConfig,
+  flush,
+  getSlackTestState,
+  getSlackClient,
+  getSlackHandlers,
+  resetSlackTestState,
+  waitForSlackEvent,
+} from "./monitor.test-helpers.js";
 
-const sendMock = vi.fn();
-const replyMock = vi.fn();
-const updateLastRouteMock = vi.fn();
-const reactMock = vi.fn();
-let config: Record<string, unknown> = {};
-const readAllowFromStoreMock = vi.fn();
-const upsertPairingRequestMock = vi.fn();
-const getSlackHandlers = () =>
-  (
-    globalThis as {
-      __slackHandlers?: Map<string, (args: unknown) => Promise<void>>;
-    }
-  ).__slackHandlers;
-const getSlackClient = () =>
-  (globalThis as { __slackClient?: Record<string, unknown> }).__slackClient;
+const { monitorSlackProvider } = await import("./monitor.js");
 
-vi.mock("../config/config.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../config/config.js")>();
-  return {
-    ...actual,
-    loadConfig: () => config,
-  };
-});
-
-vi.mock("../auto-reply/reply.js", () => ({
-  getReplyFromConfig: (...args: unknown[]) => replyMock(...args),
-}));
-
-vi.mock("./send.js", () => ({
-  sendMessageSlack: (...args: unknown[]) => sendMock(...args),
-}));
-
-vi.mock("../pairing/pairing-store.js", () => ({
-  readChannelAllowFromStore: (...args: unknown[]) => readAllowFromStoreMock(...args),
-  upsertChannelPairingRequest: (...args: unknown[]) => upsertPairingRequestMock(...args),
-}));
-
-vi.mock("../config/sessions.js", () => ({
-  resolveStorePath: vi.fn(() => "/tmp/clawdbot-sessions.json"),
-  updateLastRoute: (...args: unknown[]) => updateLastRouteMock(...args),
-  resolveSessionKey: vi.fn(),
-}));
-
-vi.mock("@slack/bolt", () => {
-  const handlers = new Map<string, (args: unknown) => Promise<void>>();
-  (globalThis as { __slackHandlers?: typeof handlers }).__slackHandlers = handlers;
-  const client = {
-    auth: { test: vi.fn().mockResolvedValue({ user_id: "bot-user" }) },
-    conversations: {
-      info: vi.fn().mockResolvedValue({
-        channel: { name: "dm", is_im: true },
-      }),
-      replies: vi.fn().mockResolvedValue({ messages: [] }),
-    },
-    users: {
-      info: vi.fn().mockResolvedValue({
-        user: { profile: { display_name: "Ada" } },
-      }),
-    },
-    assistant: {
-      threads: {
-        setStatus: vi.fn().mockResolvedValue({ ok: true }),
-      },
-    },
-    reactions: {
-      add: (...args: unknown[]) => reactMock(...args),
-    },
-  };
-  (globalThis as { __slackClient?: typeof client }).__slackClient = client;
-  class App {
-    client = client;
-    event(name: string, handler: (args: unknown) => Promise<void>) {
-      handlers.set(name, handler);
-    }
-    command() {
-      /* no-op */
-    }
-    start = vi.fn().mockResolvedValue(undefined);
-    stop = vi.fn().mockResolvedValue(undefined);
-  }
-  return { App, default: { App } };
-});
-
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-async function waitForEvent(name: string) {
-  for (let i = 0; i < 10; i += 1) {
-    if (getSlackHandlers()?.has(name)) return;
-    await flush();
-  }
-}
+const slackTestState = getSlackTestState();
+const { sendMock, replyMock } = slackTestState;
 
 beforeEach(() => {
   resetInboundDedupe();
-  config = {
-    messages: {
-      responsePrefix: "PFX",
-      ackReaction: "👀",
-      ackReactionScope: "group-mentions",
-    },
-    channels: {
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        groupPolicy: "open",
-      },
-    },
-  };
-  sendMock.mockReset().mockResolvedValue(undefined);
-  replyMock.mockReset();
-  updateLastRouteMock.mockReset();
-  reactMock.mockReset();
-  readAllowFromStoreMock.mockReset().mockResolvedValue([]);
-  upsertPairingRequestMock.mockReset().mockResolvedValue({ code: "PAIRCODE", created: true });
+  resetSlackTestState(defaultSlackTestConfig());
 });
 
 describe("monitorSlackProvider tool results", () => {
-  it("sends tool summaries with responsePrefix", async () => {
-    replyMock.mockImplementation(async (_ctx, opts) => {
-      await opts?.onToolResult?.({ text: "tool update" });
-      return { text: "final reply" };
-    });
+  it("skips tool summaries with responsePrefix", async () => {
+    replyMock.mockResolvedValue({ text: "final reply" });
 
     const controller = new AbortController();
     const run = monitorSlackProvider({
@@ -134,9 +33,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
@@ -153,14 +54,15 @@ describe("monitorSlackProvider tool results", () => {
     controller.abort();
     await run;
 
-    expect(sendMock).toHaveBeenCalledTimes(2);
-    expect(sendMock.mock.calls[0][1]).toBe("PFX tool update");
-    expect(sendMock.mock.calls[1][1]).toBe("PFX final reply");
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][1]).toBe("PFX final reply");
   });
 
   it("drops events with mismatched api_app_id", async () => {
     const client = getSlackClient();
-    if (!client) throw new Error("Slack client not registered");
+    if (!client) {
+      throw new Error("Slack client not registered");
+    }
     (client.auth as { test: ReturnType<typeof vi.fn> }).test.mockResolvedValue({
       user_id: "bot-user",
       team_id: "T1",
@@ -174,9 +76,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       body: { api_app_id: "A2", team_id: "T1" },
@@ -199,7 +103,7 @@ describe("monitorSlackProvider tool results", () => {
   });
 
   it("does not derive responsePrefix from routed agent identity when unset", async () => {
-    config = {
+    slackTestState.config = {
       agents: {
         list: [
           {
@@ -216,7 +120,7 @@ describe("monitorSlackProvider tool results", () => {
       bindings: [
         {
           agentId: "rich",
-          match: { channel: "slack", peer: { kind: "dm", id: "U1" } },
+          match: { channel: "slack", peer: { kind: "direct", id: "U1" } },
         },
       ],
       messages: {
@@ -228,10 +132,7 @@ describe("monitorSlackProvider tool results", () => {
       },
     };
 
-    replyMock.mockImplementation(async (_ctx, opts) => {
-      await opts?.onToolResult?.({ text: "tool update" });
-      return { text: "final reply" };
-    });
+    replyMock.mockResolvedValue({ text: "final reply" });
 
     const controller = new AbortController();
     const run = monitorSlackProvider({
@@ -240,9 +141,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
@@ -259,13 +162,12 @@ describe("monitorSlackProvider tool results", () => {
     controller.abort();
     await run;
 
-    expect(sendMock).toHaveBeenCalledTimes(2);
-    expect(sendMock.mock.calls[0][1]).toBe("tool update");
-    expect(sendMock.mock.calls[1][1]).toBe("final reply");
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][1]).toBe("final reply");
   });
 
-  it("wraps room history in Body and preserves RawBody", async () => {
-    config = {
+  it("preserves RawBody without injecting processed room history", async () => {
+    slackTestState.config = {
       messages: { ackReactionScope: "group-mentions" },
       channels: {
         slack: {
@@ -289,9 +191,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
@@ -320,11 +224,88 @@ describe("monitorSlackProvider tool results", () => {
     await run;
 
     expect(replyMock).toHaveBeenCalledTimes(2);
-    expect(capturedCtx.Body).toContain(HISTORY_CONTEXT_MARKER);
-    expect(capturedCtx.Body).toContain(CURRENT_MESSAGE_MARKER);
-    expect(capturedCtx.Body).toContain("first");
+    expect(capturedCtx.Body).not.toContain(HISTORY_CONTEXT_MARKER);
+    expect(capturedCtx.Body).not.toContain(CURRENT_MESSAGE_MARKER);
+    expect(capturedCtx.Body).not.toContain("first");
     expect(capturedCtx.RawBody).toBe("second");
     expect(capturedCtx.CommandBody).toBe("second");
+  });
+
+  it("scopes thread history to the thread by default", async () => {
+    slackTestState.config = {
+      messages: { ackReactionScope: "group-mentions" },
+      channels: {
+        slack: {
+          historyLimit: 5,
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { C1: { allow: true, requireMention: true } },
+        },
+      },
+    };
+
+    const capturedCtx: Array<{ Body?: string }> = [];
+    replyMock.mockImplementation(async (ctx) => {
+      capturedCtx.push(ctx ?? {});
+      return undefined;
+    });
+
+    const controller = new AbortController();
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+    });
+
+    await waitForSlackEvent("message");
+    const handler = getSlackHandlers()?.get("message");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U1",
+        text: "thread-a-one",
+        ts: "200",
+        thread_ts: "100",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U1",
+        text: "<@bot-user> thread-a-two",
+        ts: "201",
+        thread_ts: "100",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U2",
+        text: "<@bot-user> thread-b-one",
+        ts: "301",
+        thread_ts: "300",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await flush();
+    controller.abort();
+    await run;
+
+    expect(replyMock).toHaveBeenCalledTimes(2);
+    expect(capturedCtx[0]?.Body).toContain("thread-a-one");
+    expect(capturedCtx[1]?.Body).not.toContain("thread-a-one");
+    expect(capturedCtx[1]?.Body).not.toContain("thread-a-two");
   });
 
   it("updates assistant thread status when replies start", async () => {
@@ -340,9 +321,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
@@ -379,10 +362,10 @@ describe("monitorSlackProvider tool results", () => {
   });
 
   it("accepts channel messages when mentionPatterns match", async () => {
-    config = {
+    slackTestState.config = {
       messages: {
         responsePrefix: "PFX",
-        groupChat: { mentionPatterns: ["\\bclawd\\b"] },
+        groupChat: { mentionPatterns: ["\\bopenclaw\\b"] },
       },
       channels: {
         slack: {
@@ -400,15 +383,17 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
         type: "message",
         user: "U1",
-        text: "clawd: hello",
+        text: "openclaw: hello",
         ts: "123",
         channel: "C1",
         channel_type: "channel",
@@ -423,8 +408,100 @@ describe("monitorSlackProvider tool results", () => {
     expect(replyMock.mock.calls[0][0].WasMentioned).toBe(true);
   });
 
+  it("accepts channel messages when mentionPatterns match even if another user is mentioned", async () => {
+    slackTestState.config = {
+      messages: {
+        responsePrefix: "PFX",
+        groupChat: { mentionPatterns: ["\\bopenclaw\\b"] },
+      },
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { C1: { allow: true, requireMention: true } },
+        },
+      },
+    };
+    replyMock.mockResolvedValue({ text: "hi" });
+
+    const controller = new AbortController();
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+    });
+
+    await waitForSlackEvent("message");
+    const handler = getSlackHandlers()?.get("message");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U1",
+        text: "openclaw: hello <@U2>",
+        ts: "123",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await flush();
+    controller.abort();
+    await run;
+
+    expect(replyMock).toHaveBeenCalledTimes(1);
+    expect(replyMock.mock.calls[0][0].WasMentioned).toBe(true);
+  });
+
+  it("treats replies to bot threads as implicit mentions", async () => {
+    slackTestState.config = {
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { C1: { allow: true, requireMention: true } },
+        },
+      },
+    };
+    replyMock.mockResolvedValue({ text: "hi" });
+
+    const controller = new AbortController();
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+    });
+
+    await waitForSlackEvent("message");
+    const handler = getSlackHandlers()?.get("message");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U1",
+        text: "following up",
+        ts: "124",
+        thread_ts: "123",
+        parent_user_id: "bot-user",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await flush();
+    controller.abort();
+    await run;
+
+    expect(replyMock).toHaveBeenCalledTimes(1);
+    expect(replyMock.mock.calls[0][0].WasMentioned).toBe(true);
+  });
+
   it("accepts channel messages without mention when channels.slack.requireMention is false", async () => {
-    config = {
+    slackTestState.config = {
       channels: {
         slack: {
           dm: { enabled: true, policy: "open", allowFrom: ["*"] },
@@ -442,9 +519,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
@@ -476,9 +555,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {
@@ -501,7 +582,7 @@ describe("monitorSlackProvider tool results", () => {
 
   it("threads replies when incoming message is in a thread", async () => {
     replyMock.mockResolvedValue({ text: "thread reply" });
-    config = {
+    slackTestState.config = {
       messages: {
         responsePrefix: "PFX",
         ackReaction: "👀",
@@ -522,9 +603,11 @@ describe("monitorSlackProvider tool results", () => {
       abortSignal: controller.signal,
     });
 
-    await waitForEvent("message");
+    await waitForSlackEvent("message");
     const handler = getSlackHandlers()?.get("message");
-    if (!handler) throw new Error("Slack message handler not registered");
+    if (!handler) {
+      throw new Error("Slack message handler not registered");
+    }
 
     await handler({
       event: {

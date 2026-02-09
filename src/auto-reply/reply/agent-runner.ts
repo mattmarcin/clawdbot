@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
-import { setCliSessionId } from "../../agents/cli-session.js";
+import fs from "node:fs";
+import type { TypingMode } from "../../config/types.js";
+import type { OriginatingChannelType, TemplateContext } from "../templating.js";
+import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import type { TypingController } from "./typing.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
@@ -8,20 +12,19 @@ import { queueEmbeddedPiMessage } from "../../agents/pi-embedded.js";
 import { hasNonzeroUsage } from "../../agents/usage.js";
 import {
   resolveAgentIdFromSessionKey,
+  resolveSessionFilePath,
   resolveSessionTranscriptPath,
   type SessionEntry,
-  saveSessionStore,
+  updateSessionStore,
   updateSessionStoreEntry,
 } from "../../config/sessions.js";
-import type { TypingMode } from "../../config/types.js";
-import { logVerbose } from "../../globals.js";
+import { emitDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { defaultRuntime } from "../../runtime.js";
-import { resolveModelCostConfig } from "../../utils/usage-format.js";
-import type { OriginatingChannelType, TemplateContext } from "../templating.js";
-import type { VerboseLevel } from "../thinking.js";
-import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
+import { resolveResponseUsageMode, type VerboseLevel } from "../thinking.js";
 import { runAgentTurnWithFallback } from "./agent-runner-execution.js";
 import {
+  createShouldEmitToolOutput,
   createShouldEmitToolResult,
   finalizeWithFollowup,
   isAudioPayload,
@@ -36,7 +39,7 @@ import { createFollowupRunner } from "./followup-runner.js";
 import { enqueueFollowupRun, type FollowupRun, type QueueSettings } from "./queue.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
 import { incrementCompactionCount } from "./session-updates.js";
-import type { TypingController } from "./typing.js";
+import { persistSessionUsageUpdate } from "./session-usage.js";
 import { createTypingSignaler } from "./typing-mode.js";
 
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
@@ -65,6 +68,7 @@ export async function runReplyAgent(params: {
     minChars: number;
     maxChars: number;
     breakPreference: "paragraph" | "newline" | "sentence";
+    flushOnParagraph?: boolean;
   };
   resolvedBlockStreamingBreak: "text_end" | "message_end";
   sessionCtx: TemplateContext;
@@ -114,6 +118,11 @@ export async function runReplyAgent(params: {
     storePath,
     resolvedVerboseLevel,
   });
+  const shouldEmitToolOutput = createShouldEmitToolOutput({
+    sessionKey,
+    storePath,
+    resolvedVerboseLevel,
+  });
 
   const pendingToolTasks = new Set<Promise<void>>();
   const blockReplyTimeoutMs = opts?.blockReplyTimeoutMs ?? BLOCK_REPLY_SEND_TIMEOUT_MS;
@@ -127,6 +136,7 @@ export async function runReplyAgent(params: {
     followupRun.run.config,
     replyToChannel,
     sessionCtx.AccountId,
+    sessionCtx.ChatType,
   );
   const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel);
   const cfg = followupRun.run.config;
@@ -153,10 +163,15 @@ export async function runReplyAgent(params: {
     const steered = queueEmbeddedPiMessage(followupRun.run.sessionId, followupRun.prompt);
     if (steered && !shouldFollowup) {
       if (activeSessionEntry && activeSessionStore && sessionKey) {
-        activeSessionEntry.updatedAt = Date.now();
+        const updatedAt = Date.now();
+        activeSessionEntry.updatedAt = updatedAt;
         activeSessionStore[sessionKey] = activeSessionEntry;
         if (storePath) {
-          await saveSessionStore(storePath, activeSessionStore);
+          await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({ updatedAt }),
+          });
         }
       }
       typing.cleanup();
@@ -167,15 +182,22 @@ export async function runReplyAgent(params: {
   if (isActive && (shouldFollowup || resolvedQueue.mode === "steer")) {
     enqueueFollowupRun(queueKey, followupRun, resolvedQueue);
     if (activeSessionEntry && activeSessionStore && sessionKey) {
-      activeSessionEntry.updatedAt = Date.now();
+      const updatedAt = Date.now();
+      activeSessionEntry.updatedAt = updatedAt;
       activeSessionStore[sessionKey] = activeSessionEntry;
       if (storePath) {
-        await saveSessionStore(storePath, activeSessionStore);
+        await updateSessionStoreEntry({
+          storePath,
+          sessionKey,
+          update: async () => ({ updatedAt }),
+        });
       }
     }
     typing.cleanup();
     return undefined;
   }
+
+  await typingSignals.signalRunStart();
 
   activeSessionEntry = await runMemoryFlushIfNeeded({
     cfg,
@@ -205,39 +227,86 @@ export async function runReplyAgent(params: {
   });
 
   let responseUsageLine: string | undefined;
-  const resetSessionAfterCompactionFailure = async (reason: string): Promise<boolean> => {
-    if (!sessionKey || !activeSessionStore || !storePath) return false;
+  type SessionResetOptions = {
+    failureLabel: string;
+    buildLogMessage: (nextSessionId: string) => string;
+    cleanupTranscripts?: boolean;
+  };
+  const resetSession = async ({
+    failureLabel,
+    buildLogMessage,
+    cleanupTranscripts,
+  }: SessionResetOptions): Promise<boolean> => {
+    if (!sessionKey || !activeSessionStore || !storePath) {
+      return false;
+    }
+    const prevEntry = activeSessionStore[sessionKey] ?? activeSessionEntry;
+    if (!prevEntry) {
+      return false;
+    }
+    const prevSessionId = cleanupTranscripts ? prevEntry.sessionId : undefined;
     const nextSessionId = crypto.randomUUID();
     const nextEntry: SessionEntry = {
-      ...(activeSessionStore[sessionKey] ?? activeSessionEntry),
+      ...prevEntry,
       sessionId: nextSessionId,
       updatedAt: Date.now(),
       systemSent: false,
       abortedLastRun: false,
     };
     const agentId = resolveAgentIdFromSessionKey(sessionKey);
-    const topicId =
-      typeof sessionCtx.MessageThreadId === "number" ? sessionCtx.MessageThreadId : undefined;
-    const nextSessionFile = resolveSessionTranscriptPath(nextSessionId, agentId, topicId);
+    const nextSessionFile = resolveSessionTranscriptPath(
+      nextSessionId,
+      agentId,
+      sessionCtx.MessageThreadId,
+    );
     nextEntry.sessionFile = nextSessionFile;
     activeSessionStore[sessionKey] = nextEntry;
     try {
-      await saveSessionStore(storePath, activeSessionStore);
+      await updateSessionStore(storePath, (store) => {
+        store[sessionKey] = nextEntry;
+      });
     } catch (err) {
       defaultRuntime.error(
-        `Failed to persist session reset after compaction failure (${sessionKey}): ${String(err)}`,
+        `Failed to persist session reset after ${failureLabel} (${sessionKey}): ${String(err)}`,
       );
     }
     followupRun.run.sessionId = nextSessionId;
     followupRun.run.sessionFile = nextSessionFile;
     activeSessionEntry = nextEntry;
     activeIsNewSession = true;
-    defaultRuntime.error(
-      `Auto-compaction failed (${reason}). Restarting session ${sessionKey} -> ${nextSessionId} and retrying.`,
-    );
+    defaultRuntime.error(buildLogMessage(nextSessionId));
+    if (cleanupTranscripts && prevSessionId) {
+      const transcriptCandidates = new Set<string>();
+      const resolved = resolveSessionFilePath(prevSessionId, prevEntry, { agentId });
+      if (resolved) {
+        transcriptCandidates.add(resolved);
+      }
+      transcriptCandidates.add(resolveSessionTranscriptPath(prevSessionId, agentId));
+      for (const candidate of transcriptCandidates) {
+        try {
+          fs.unlinkSync(candidate);
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+    }
     return true;
   };
+  const resetSessionAfterCompactionFailure = async (reason: string): Promise<boolean> =>
+    resetSession({
+      failureLabel: "compaction failure",
+      buildLogMessage: (nextSessionId) =>
+        `Auto-compaction failed (${reason}). Restarting session ${sessionKey} -> ${nextSessionId} and retrying.`,
+    });
+  const resetSessionAfterRoleOrderingConflict = async (reason: string): Promise<boolean> =>
+    resetSession({
+      failureLabel: "role ordering conflict",
+      buildLogMessage: (nextSessionId) =>
+        `Role ordering conflict (${reason}). Restarting session ${sessionKey} -> ${nextSessionId}.`,
+      cleanupTranscripts: true,
+    });
   try {
+    const runStartedAt = Date.now();
     const runOutcome = await runAgentTurnWithFallback({
       commandBody,
       followupRun,
@@ -250,8 +319,10 @@ export async function runReplyAgent(params: {
       resolvedBlockStreamingBreak,
       applyReplyToMode,
       shouldEmitToolResult,
+      shouldEmitToolOutput,
       pendingToolTasks,
       resetSessionAfterCompactionFailure,
+      resetSessionAfterRoleOrderingConflict,
       isHeartbeat,
       sessionKey,
       getActiveSessionEntry: () => activeSessionEntry,
@@ -264,7 +335,7 @@ export async function runReplyAgent(params: {
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
-    const { runResult, fallbackProvider, fallbackModel } = runOutcome;
+    const { runResult, fallbackProvider, fallbackModel, directlySentBlockKeys } = runOutcome;
     let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
 
     if (
@@ -274,11 +345,19 @@ export async function runReplyAgent(params: {
       sessionKey &&
       activeSessionEntry.groupActivationNeedsSystemIntro
     ) {
+      const updatedAt = Date.now();
       activeSessionEntry.groupActivationNeedsSystemIntro = false;
-      activeSessionEntry.updatedAt = Date.now();
+      activeSessionEntry.updatedAt = updatedAt;
       activeSessionStore[sessionKey] = activeSessionEntry;
       if (storePath) {
-        await saveSessionStore(storePath, activeSessionStore);
+        await updateSessionStoreEntry({
+          storePath,
+          sessionKey,
+          update: async () => ({
+            groupActivationNeedsSystemIntro: false,
+            updatedAt,
+          }),
+        });
       }
     }
 
@@ -291,35 +370,6 @@ export async function runReplyAgent(params: {
     if (pendingToolTasks.size > 0) {
       await Promise.allSettled(pendingToolTasks);
     }
-
-    // Drain any late tool/block deliveries before deciding there's "nothing to send".
-    // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
-    // keep the typing indicator stuck.
-    if (payloadArray.length === 0)
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
-
-    const payloadResult = buildReplyPayloads({
-      payloads: payloadArray,
-      isHeartbeat,
-      didLogHeartbeatStrip,
-      blockStreamingEnabled,
-      blockReplyPipeline,
-      replyToMode,
-      replyToChannel,
-      currentMessageId: sessionCtx.MessageSid,
-      messageProvider: followupRun.run.messageProvider,
-      messagingToolSentTexts: runResult.messagingToolSentTexts,
-      messagingToolSentTargets: runResult.messagingToolSentTargets,
-      originatingTo: sessionCtx.OriginatingTo ?? sessionCtx.To,
-      accountId: sessionCtx.AccountId,
-    });
-    const { replyPayloads } = payloadResult;
-    didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
-
-    if (replyPayloads.length === 0)
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
-
-    await signalTypingIfNeeded(replyPayloads, typingSignals);
 
     const usage = runResult.meta.agentMeta?.usage;
     const modelUsed = runResult.meta.agentMeta?.model ?? fallbackModel ?? defaultModel;
@@ -334,76 +384,91 @@ export async function runReplyAgent(params: {
       activeSessionEntry?.contextTokens ??
       DEFAULT_CONTEXT_TOKENS;
 
-    if (storePath && sessionKey) {
-      if (hasNonzeroUsage(usage)) {
-        try {
-          await updateSessionStoreEntry({
-            storePath,
-            sessionKey,
-            update: async (entry) => {
-              const input = usage.input ?? 0;
-              const output = usage.output ?? 0;
-              const promptTokens = input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-              const patch: Partial<SessionEntry> = {
-                inputTokens: input,
-                outputTokens: output,
-                totalTokens: promptTokens > 0 ? promptTokens : (usage.total ?? input),
-                modelProvider: providerUsed,
-                model: modelUsed,
-                contextTokens: contextTokensUsed ?? entry.contextTokens,
-                systemPromptReport: runResult.meta.systemPromptReport ?? entry.systemPromptReport,
-                updatedAt: Date.now(),
-              };
-              if (cliSessionId) {
-                const nextEntry = { ...entry, ...patch };
-                setCliSessionId(nextEntry, providerUsed, cliSessionId);
-                return {
-                  ...patch,
-                  cliSessionIds: nextEntry.cliSessionIds,
-                  claudeCliSessionId: nextEntry.claudeCliSessionId,
-                };
-              }
-              return patch;
-            },
-          });
-        } catch (err) {
-          logVerbose(`failed to persist usage update: ${String(err)}`);
-        }
-      } else if (modelUsed || contextTokensUsed) {
-        try {
-          await updateSessionStoreEntry({
-            storePath,
-            sessionKey,
-            update: async (entry) => {
-              const patch: Partial<SessionEntry> = {
-                modelProvider: providerUsed ?? entry.modelProvider,
-                model: modelUsed ?? entry.model,
-                contextTokens: contextTokensUsed ?? entry.contextTokens,
-                systemPromptReport: runResult.meta.systemPromptReport ?? entry.systemPromptReport,
-                updatedAt: Date.now(),
-              };
-              if (cliSessionId) {
-                const nextEntry = { ...entry, ...patch };
-                setCliSessionId(nextEntry, providerUsed, cliSessionId);
-                return {
-                  ...patch,
-                  cliSessionIds: nextEntry.cliSessionIds,
-                  claudeCliSessionId: nextEntry.claudeCliSessionId,
-                };
-              }
-              return patch;
-            },
-          });
-        } catch (err) {
-          logVerbose(`failed to persist model/context update: ${String(err)}`);
-        }
-      }
+    await persistSessionUsageUpdate({
+      storePath,
+      sessionKey,
+      usage,
+      modelUsed,
+      providerUsed,
+      contextTokensUsed,
+      systemPromptReport: runResult.meta.systemPromptReport,
+      cliSessionId,
+    });
+
+    // Drain any late tool/block deliveries before deciding there's "nothing to send".
+    // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
+    // keep the typing indicator stuck.
+    if (payloadArray.length === 0) {
+      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
     }
 
-    const responseUsageEnabled =
-      (activeSessionEntry?.responseUsage ??
-        (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined)) === "on";
-    if (responseUsageEnabled && hasNonzeroUsage(usage)) {
+    const payloadResult = buildReplyPayloads({
+      payloads: payloadArray,
+      isHeartbeat,
+      didLogHeartbeatStrip,
+      blockStreamingEnabled,
+      blockReplyPipeline,
+      directlySentBlockKeys,
+      replyToMode,
+      replyToChannel,
+      currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
+      messageProvider: followupRun.run.messageProvider,
+      messagingToolSentTexts: runResult.messagingToolSentTexts,
+      messagingToolSentTargets: runResult.messagingToolSentTargets,
+      originatingTo: sessionCtx.OriginatingTo ?? sessionCtx.To,
+      accountId: sessionCtx.AccountId,
+    });
+    const { replyPayloads } = payloadResult;
+    didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
+
+    if (replyPayloads.length === 0) {
+      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+    }
+
+    await signalTypingIfNeeded(replyPayloads, typingSignals);
+
+    if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
+      const input = usage.input ?? 0;
+      const output = usage.output ?? 0;
+      const cacheRead = usage.cacheRead ?? 0;
+      const cacheWrite = usage.cacheWrite ?? 0;
+      const promptTokens = input + cacheRead + cacheWrite;
+      const totalTokens = usage.total ?? promptTokens + output;
+      const costConfig = resolveModelCostConfig({
+        provider: providerUsed,
+        model: modelUsed,
+        config: cfg,
+      });
+      const costUsd = estimateUsageCost({ usage, cost: costConfig });
+      emitDiagnosticEvent({
+        type: "model.usage",
+        sessionKey,
+        sessionId: followupRun.run.sessionId,
+        channel: replyToChannel,
+        provider: providerUsed,
+        model: modelUsed,
+        usage: {
+          input,
+          output,
+          cacheRead,
+          cacheWrite,
+          promptTokens,
+          total: totalTokens,
+        },
+        context: {
+          limit: contextTokensUsed,
+          used: totalTokens,
+        },
+        costUsd,
+        durationMs: Date.now() - runStartedAt,
+      });
+    }
+
+    const responseUsageRaw =
+      activeSessionEntry?.responseUsage ??
+      (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined);
+    const responseUsageMode = resolveResponseUsageMode(responseUsageRaw);
+    if (responseUsageMode !== "off" && hasNonzeroUsage(usage)) {
       const authMode = resolveModelAuthMode(providerUsed, cfg);
       const showCost = authMode === "api-key";
       const costConfig = showCost
@@ -413,16 +478,22 @@ export async function runReplyAgent(params: {
             config: cfg,
           })
         : undefined;
-      const formatted = formatResponseUsageLine({
+      let formatted = formatResponseUsageLine({
         usage,
         showCost,
         costConfig,
       });
-      if (formatted) responseUsageLine = formatted;
+      if (formatted && responseUsageMode === "full" && sessionKey) {
+        formatted = `${formatted} · session ${sessionKey}`;
+      }
+      if (formatted) {
+        responseUsageLine = formatted;
+      }
     }
 
     // If verbose is enabled and this is a new session, prepend a session hint.
     let finalPayloads = replyPayloads;
+    const verboseEnabled = resolvedVerboseLevel !== "off";
     if (autoCompactionCompleted) {
       const count = await incrementCompactionCount({
         sessionEntry: activeSessionEntry,
@@ -430,12 +501,12 @@ export async function runReplyAgent(params: {
         sessionKey,
         storePath,
       });
-      if (resolvedVerboseLevel === "on") {
+      if (verboseEnabled) {
         const suffix = typeof count === "number" ? ` (count ${count})` : "";
         finalPayloads = [{ text: `🧹 Auto-compaction complete${suffix}.` }, ...finalPayloads];
       }
     }
-    if (resolvedVerboseLevel === "on" && activeIsNewSession) {
+    if (verboseEnabled && activeIsNewSession) {
       finalPayloads = [{ text: `🧭 New session: ${followupRun.run.sessionId}` }, ...finalPayloads];
     }
     if (responseUsageLine) {

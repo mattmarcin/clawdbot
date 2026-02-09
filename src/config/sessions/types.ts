@@ -1,15 +1,35 @@
-import crypto from "node:crypto";
-
 import type { Skill } from "@mariozechner/pi-coding-agent";
+import crypto from "node:crypto";
+import type { ChatType } from "../../channels/chat-type.js";
 import type { ChannelId } from "../../channels/plugins/types.js";
+import type { DeliveryContext } from "../../utils/delivery-context.js";
+import type { TtsAutoMode } from "../types.tts.js";
 
 export type SessionScope = "per-sender" | "global";
 
 export type SessionChannelId = ChannelId | "webchat";
 
-export type SessionChatType = "direct" | "group" | "room";
+export type SessionChatType = ChatType;
+
+export type SessionOrigin = {
+  label?: string;
+  provider?: string;
+  surface?: string;
+  chatType?: SessionChatType;
+  from?: string;
+  to?: string;
+  accountId?: string;
+  threadId?: string | number;
+};
 
 export type SessionEntry = {
+  /**
+   * Last delivered heartbeat payload (used to suppress duplicate heartbeat notifications).
+   * Stored on the main session entry.
+   */
+  lastHeartbeatText?: string;
+  /** Timestamp (ms) when lastHeartbeatText was delivered. */
+  lastHeartbeatSentAt?: number;
   sessionId: string;
   updatedAt: number;
   sessionFile?: string;
@@ -22,10 +42,17 @@ export type SessionEntry = {
   verboseLevel?: string;
   reasoningLevel?: string;
   elevatedLevel?: string;
-  responseUsage?: "on" | "off";
+  ttsAuto?: TtsAutoMode;
+  execHost?: string;
+  execSecurity?: string;
+  execAsk?: string;
+  execNode?: string;
+  responseUsage?: "on" | "off" | "tokens" | "full";
   providerOverride?: string;
   modelOverride?: string;
   authProfileOverride?: string;
+  authProfileOverrideSource?: "auto" | "user";
+  authProfileOverrideCompactionCount?: number;
   groupActivation?: "mention" | "always";
   groupActivationNeedsSystemIntro?: boolean;
   sendPolicy?: "allow" | "deny";
@@ -54,12 +81,16 @@ export type SessionEntry = {
   label?: string;
   displayName?: string;
   channel?: string;
+  groupId?: string;
   subject?: string;
-  room?: string;
+  groupChannel?: string;
   space?: string;
+  origin?: SessionOrigin;
+  deliveryContext?: DeliveryContext;
   lastChannel?: SessionChannelId;
   lastTo?: string;
   lastAccountId?: string;
+  lastThreadId?: string | number;
   skillsSnapshot?: SessionSkillSnapshot;
   systemPromptReport?: SessionSystemPromptReport;
 };
@@ -70,13 +101,14 @@ export function mergeSessionEntry(
 ): SessionEntry {
   const sessionId = patch.sessionId ?? existing?.sessionId ?? crypto.randomUUID();
   const updatedAt = Math.max(existing?.updatedAt ?? 0, patch.updatedAt ?? 0, Date.now());
-  if (!existing) return { ...patch, sessionId, updatedAt };
+  if (!existing) {
+    return { ...patch, sessionId, updatedAt };
+  }
   return { ...existing, ...patch, sessionId, updatedAt };
 }
 
 export type GroupKeyResolution = {
   key: string;
-  legacyKey?: string;
   channel?: string;
   id?: string;
   chatType?: SessionChatType;
@@ -86,6 +118,7 @@ export type SessionSkillSnapshot = {
   prompt: string;
   skills: Array<{ name: string; primaryEnv?: string }>;
   resolvedSkills?: Skill[];
+  version?: number;
 };
 
 export type SessionSystemPromptReport = {

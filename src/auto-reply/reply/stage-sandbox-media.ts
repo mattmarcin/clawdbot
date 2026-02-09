@@ -1,15 +1,19 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ensureSandboxWorkspaceForSession } from "../../agents/sandbox.js";
-import type { ClawdbotConfig } from "../../config/config.js";
-import { logVerbose } from "../../globals.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import type { MsgContext, TemplateContext } from "../templating.js";
+import { assertSandboxPath } from "../../agents/sandbox-paths.js";
+import { ensureSandboxWorkspaceForSession } from "../../agents/sandbox.js";
+import { logVerbose } from "../../globals.js";
+import { getMediaDir } from "../../media/store.js";
+import { CONFIG_DIR } from "../../utils.js";
 
 export async function stageSandboxMedia(params: {
   ctx: MsgContext;
   sessionCtx: TemplateContext;
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   sessionKey?: string;
   workspaceDir: string;
 }) {
@@ -22,18 +26,30 @@ export async function stageSandboxMedia(params: {
       : ctx.MediaPath?.trim()
         ? [ctx.MediaPath.trim()]
         : [];
-  if (rawPaths.length === 0 || !sessionKey) return;
+  if (rawPaths.length === 0 || !sessionKey) {
+    return;
+  }
 
   const sandbox = await ensureSandboxWorkspaceForSession({
     config: cfg,
     sessionKey,
     workspaceDir,
   });
-  if (!sandbox) return;
+
+  // For remote attachments without sandbox, use ~/.openclaw/media (not agent workspace for privacy)
+  const remoteMediaCacheDir = ctx.MediaRemoteHost
+    ? path.join(CONFIG_DIR, "media", "remote-cache", sessionKey)
+    : null;
+  const effectiveWorkspaceDir = sandbox?.workspaceDir ?? remoteMediaCacheDir;
+  if (!effectiveWorkspaceDir) {
+    return;
+  }
 
   const resolveAbsolutePath = (value: string): string | null => {
     let resolved = value.trim();
-    if (!resolved) return null;
+    if (!resolved) {
+      return null;
+    }
     if (resolved.startsWith("file://")) {
       try {
         resolved = fileURLToPath(resolved);
@@ -41,12 +57,17 @@ export async function stageSandboxMedia(params: {
         return null;
       }
     }
-    if (!path.isAbsolute(resolved)) return null;
+    if (!path.isAbsolute(resolved)) {
+      return null;
+    }
     return resolved;
   };
 
   try {
-    const destDir = path.join(sandbox.workspaceDir, "media", "inbound");
+    // For sandbox: <workspace>/media/inbound, for remote cache: use dir directly
+    const destDir = sandbox
+      ? path.join(effectiveWorkspaceDir, "media", "inbound")
+      : effectiveWorkspaceDir;
     await fs.mkdir(destDir, { recursive: true });
 
     const usedNames = new Set<string>();
@@ -54,11 +75,32 @@ export async function stageSandboxMedia(params: {
 
     for (const raw of rawPaths) {
       const source = resolveAbsolutePath(raw);
-      if (!source) continue;
-      if (staged.has(source)) continue;
+      if (!source) {
+        continue;
+      }
+      if (staged.has(source)) {
+        continue;
+      }
+
+      // Local paths must be restricted to the media directory.
+      if (!ctx.MediaRemoteHost) {
+        const mediaDir = getMediaDir();
+        try {
+          await assertSandboxPath({
+            filePath: source,
+            cwd: mediaDir,
+            root: mediaDir,
+          });
+        } catch {
+          logVerbose(`Blocking attempt to stage media from outside media directory: ${source}`);
+          continue;
+        }
+      }
 
       const baseName = path.basename(source);
-      if (!baseName) continue;
+      if (!baseName) {
+        continue;
+      }
       const parsed = path.parse(baseName);
       let fileName = baseName;
       let suffix = 1;
@@ -69,16 +111,26 @@ export async function stageSandboxMedia(params: {
       usedNames.add(fileName);
 
       const dest = path.join(destDir, fileName);
-      await fs.copyFile(source, dest);
-      const relative = path.posix.join("media", "inbound", fileName);
-      staged.set(source, relative);
+      if (ctx.MediaRemoteHost) {
+        // Always use SCP when remote host is configured - local paths refer to remote machine
+        await scpFile(ctx.MediaRemoteHost, source, dest);
+      } else {
+        await fs.copyFile(source, dest);
+      }
+      // For sandbox use relative path, for remote cache use absolute path
+      const stagedPath = sandbox ? path.posix.join("media", "inbound", fileName) : dest;
+      staged.set(source, stagedPath);
     }
 
     const rewriteIfStaged = (value: string | undefined): string | undefined => {
       const raw = value?.trim();
-      if (!raw) return value;
+      if (!raw) {
+        return value;
+      }
       const abs = resolveAbsolutePath(raw);
-      if (!abs) return value;
+      if (!abs) {
+        return value;
+      }
       const mapped = staged.get(abs);
       return mapped ?? value;
     };
@@ -110,4 +162,36 @@ export async function stageSandboxMedia(params: {
   } catch (err) {
     logVerbose(`Failed to stage inbound media for sandbox: ${String(err)}`);
   }
+}
+
+async function scpFile(remoteHost: string, remotePath: string, localPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "/usr/bin/scp",
+      [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        `${remoteHost}:${remotePath}`,
+        localPath,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`scp failed (${code}): ${stderr.trim()}`));
+      }
+    });
+  });
 }

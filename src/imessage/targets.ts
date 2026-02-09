@@ -29,32 +29,68 @@ function stripPrefix(value: string, prefix: string): string {
 
 export function normalizeIMessageHandle(raw: string): string {
   const trimmed = raw.trim();
-  if (!trimmed) return "";
+  if (!trimmed) {
+    return "";
+  }
   const lowered = trimmed.toLowerCase();
-  if (lowered.startsWith("imessage:")) return normalizeIMessageHandle(trimmed.slice(9));
-  if (lowered.startsWith("sms:")) return normalizeIMessageHandle(trimmed.slice(4));
-  if (lowered.startsWith("auto:")) return normalizeIMessageHandle(trimmed.slice(5));
-  if (trimmed.includes("@")) return trimmed.toLowerCase();
+  if (lowered.startsWith("imessage:")) {
+    return normalizeIMessageHandle(trimmed.slice(9));
+  }
+  if (lowered.startsWith("sms:")) {
+    return normalizeIMessageHandle(trimmed.slice(4));
+  }
+  if (lowered.startsWith("auto:")) {
+    return normalizeIMessageHandle(trimmed.slice(5));
+  }
+
+  // Normalize chat_id/chat_guid/chat_identifier prefixes case-insensitively
+  for (const prefix of CHAT_ID_PREFIXES) {
+    if (lowered.startsWith(prefix)) {
+      const value = trimmed.slice(prefix.length).trim();
+      return `chat_id:${value}`;
+    }
+  }
+  for (const prefix of CHAT_GUID_PREFIXES) {
+    if (lowered.startsWith(prefix)) {
+      const value = trimmed.slice(prefix.length).trim();
+      return `chat_guid:${value}`;
+    }
+  }
+  for (const prefix of CHAT_IDENTIFIER_PREFIXES) {
+    if (lowered.startsWith(prefix)) {
+      const value = trimmed.slice(prefix.length).trim();
+      return `chat_identifier:${value}`;
+    }
+  }
+
+  if (trimmed.includes("@")) {
+    return trimmed.toLowerCase();
+  }
   const normalized = normalizeE164(trimmed);
-  if (normalized) return normalized;
+  if (normalized) {
+    return normalized;
+  }
   return trimmed.replace(/\s+/g, "");
 }
 
 export function parseIMessageTarget(raw: string): IMessageTarget {
   const trimmed = raw.trim();
-  if (!trimmed) throw new Error("iMessage target is required");
+  if (!trimmed) {
+    throw new Error("iMessage target is required");
+  }
   const lower = trimmed.toLowerCase();
 
   for (const { prefix, service } of SERVICE_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const remainder = stripPrefix(trimmed, prefix);
-      if (!remainder) throw new Error(`${prefix} target is required`);
+      if (!remainder) {
+        throw new Error(`${prefix} target is required`);
+      }
       const remainderLower = remainder.toLowerCase();
       const isChatTarget =
         CHAT_ID_PREFIXES.some((p) => remainderLower.startsWith(p)) ||
         CHAT_GUID_PREFIXES.some((p) => remainderLower.startsWith(p)) ||
-        CHAT_IDENTIFIER_PREFIXES.some((p) => remainderLower.startsWith(p)) ||
-        remainderLower.startsWith("group:");
+        CHAT_IDENTIFIER_PREFIXES.some((p) => remainderLower.startsWith(p));
       if (isChatTarget) {
         return parseIMessageTarget(remainder);
       }
@@ -76,7 +112,9 @@ export function parseIMessageTarget(raw: string): IMessageTarget {
   for (const prefix of CHAT_GUID_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const value = stripPrefix(trimmed, prefix);
-      if (!value) throw new Error("chat_guid is required");
+      if (!value) {
+        throw new Error("chat_guid is required");
+      }
       return { kind: "chat_guid", chatGuid: value };
     }
   }
@@ -84,19 +122,11 @@ export function parseIMessageTarget(raw: string): IMessageTarget {
   for (const prefix of CHAT_IDENTIFIER_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const value = stripPrefix(trimmed, prefix);
-      if (!value) throw new Error("chat_identifier is required");
+      if (!value) {
+        throw new Error("chat_identifier is required");
+      }
       return { kind: "chat_identifier", chatIdentifier: value };
     }
-  }
-
-  if (lower.startsWith("group:")) {
-    const value = stripPrefix(trimmed, "group:");
-    const chatId = Number.parseInt(value, 10);
-    if (Number.isFinite(chatId)) {
-      return { kind: "chat_id", chatId };
-    }
-    if (!value) throw new Error("group target is required");
-    return { kind: "chat_guid", chatGuid: value };
   }
 
   return { kind: "handle", to: trimmed, service: "auto" };
@@ -104,13 +134,17 @@ export function parseIMessageTarget(raw: string): IMessageTarget {
 
 export function parseIMessageAllowTarget(raw: string): IMessageAllowTarget {
   const trimmed = raw.trim();
-  if (!trimmed) return { kind: "handle", handle: "" };
+  if (!trimmed) {
+    return { kind: "handle", handle: "" };
+  }
   const lower = trimmed.toLowerCase();
 
   for (const { prefix } of SERVICE_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const remainder = stripPrefix(trimmed, prefix);
-      if (!remainder) return { kind: "handle", handle: "" };
+      if (!remainder) {
+        return { kind: "handle", handle: "" };
+      }
       return parseIMessageAllowTarget(remainder);
     }
   }
@@ -119,29 +153,28 @@ export function parseIMessageAllowTarget(raw: string): IMessageAllowTarget {
     if (lower.startsWith(prefix)) {
       const value = stripPrefix(trimmed, prefix);
       const chatId = Number.parseInt(value, 10);
-      if (Number.isFinite(chatId)) return { kind: "chat_id", chatId };
+      if (Number.isFinite(chatId)) {
+        return { kind: "chat_id", chatId };
+      }
     }
   }
 
   for (const prefix of CHAT_GUID_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const value = stripPrefix(trimmed, prefix);
-      if (value) return { kind: "chat_guid", chatGuid: value };
+      if (value) {
+        return { kind: "chat_guid", chatGuid: value };
+      }
     }
   }
 
   for (const prefix of CHAT_IDENTIFIER_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const value = stripPrefix(trimmed, prefix);
-      if (value) return { kind: "chat_identifier", chatIdentifier: value };
+      if (value) {
+        return { kind: "chat_identifier", chatIdentifier: value };
+      }
     }
-  }
-
-  if (lower.startsWith("group:")) {
-    const value = stripPrefix(trimmed, "group:");
-    const chatId = Number.parseInt(value, 10);
-    if (Number.isFinite(chatId)) return { kind: "chat_id", chatId };
-    if (value) return { kind: "chat_guid", chatGuid: value };
   }
 
   return { kind: "handle", handle: normalizeIMessageHandle(trimmed) };
@@ -155,8 +188,12 @@ export function isAllowedIMessageSender(params: {
   chatIdentifier?: string | null;
 }): boolean {
   const allowFrom = params.allowFrom.map((entry) => String(entry).trim());
-  if (allowFrom.length === 0) return true;
-  if (allowFrom.includes("*")) return true;
+  if (allowFrom.length === 0) {
+    return true;
+  }
+  if (allowFrom.includes("*")) {
+    return true;
+  }
 
   const senderNormalized = normalizeIMessageHandle(params.sender);
   const chatId = params.chatId ?? undefined;
@@ -164,22 +201,34 @@ export function isAllowedIMessageSender(params: {
   const chatIdentifier = params.chatIdentifier?.trim();
 
   for (const entry of allowFrom) {
-    if (!entry) continue;
+    if (!entry) {
+      continue;
+    }
     const parsed = parseIMessageAllowTarget(entry);
     if (parsed.kind === "chat_id" && chatId !== undefined) {
-      if (parsed.chatId === chatId) return true;
+      if (parsed.chatId === chatId) {
+        return true;
+      }
     } else if (parsed.kind === "chat_guid" && chatGuid) {
-      if (parsed.chatGuid === chatGuid) return true;
+      if (parsed.chatGuid === chatGuid) {
+        return true;
+      }
     } else if (parsed.kind === "chat_identifier" && chatIdentifier) {
-      if (parsed.chatIdentifier === chatIdentifier) return true;
+      if (parsed.chatIdentifier === chatIdentifier) {
+        return true;
+      }
     } else if (parsed.kind === "handle" && senderNormalized) {
-      if (parsed.handle === senderNormalized) return true;
+      if (parsed.handle === senderNormalized) {
+        return true;
+      }
     }
   }
   return false;
 }
 
 export function formatIMessageChatTarget(chatId?: number | null): string {
-  if (!chatId || !Number.isFinite(chatId)) return "";
+  if (!chatId || !Number.isFinite(chatId)) {
+    return "";
+  }
   return `chat_id:${chatId}`;
 }

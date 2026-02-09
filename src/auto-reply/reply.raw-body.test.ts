@@ -24,10 +24,10 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
     },
     {
       env: {
-        CLAWDBOT_AGENT_DIR: (home) => path.join(home, ".clawdbot", "agent"),
-        PI_CODING_AGENT_DIR: (home) => path.join(home, ".clawdbot", "agent"),
+        OPENCLAW_AGENT_DIR: (home) => path.join(home, ".openclaw", "agent"),
+        PI_CODING_AGENT_DIR: (home) => path.join(home, ".openclaw", "agent"),
       },
-      prefix: "clawdbot-rawbody-",
+      prefix: "openclaw-rawbody-",
     },
   );
 }
@@ -54,6 +54,7 @@ describe("RawBody directive parsing", () => {
         From: "+1222",
         To: "+1222",
         ChatType: "group",
+        CommandAuthorized: true,
       };
 
       const res = await getReplyFromConfig(
@@ -63,7 +64,7 @@ describe("RawBody directive parsing", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "clawd"),
+              workspace: path.join(home, "openclaw"),
             },
           },
           channels: { whatsapp: { allowFrom: ["*"] } },
@@ -87,6 +88,7 @@ describe("RawBody directive parsing", () => {
         From: "+1222",
         To: "+1222",
         ChatType: "group",
+        CommandAuthorized: true,
       };
 
       const res = await getReplyFromConfig(
@@ -96,7 +98,7 @@ describe("RawBody directive parsing", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "clawd"),
+              workspace: path.join(home, "openclaw"),
               models: {
                 "anthropic/claude-opus-4-5": {},
               },
@@ -123,6 +125,7 @@ describe("RawBody directive parsing", () => {
         From: "+1222",
         To: "+1222",
         ChatType: "group",
+        CommandAuthorized: true,
       };
 
       const res = await getReplyFromConfig(
@@ -132,7 +135,7 @@ describe("RawBody directive parsing", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "clawd"),
+              workspace: path.join(home, "openclaw"),
             },
           },
           channels: { whatsapp: { allowFrom: ["*"] } },
@@ -156,10 +159,11 @@ describe("RawBody directive parsing", () => {
         ChatType: "group",
         From: "+1222",
         To: "+1222",
-        SessionKey: "agent:main:whatsapp:group:G1",
+        SessionKey: "agent:main:whatsapp:group:g1",
         Provider: "whatsapp",
         Surface: "whatsapp",
         SenderE164: "+1222",
+        CommandAuthorized: true,
       };
 
       const res = await getReplyFromConfig(
@@ -169,7 +173,7 @@ describe("RawBody directive parsing", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "clawd"),
+              workspace: path.join(home, "openclaw"),
             },
           },
           channels: { whatsapp: { allowFrom: ["+1222"] } },
@@ -178,7 +182,7 @@ describe("RawBody directive parsing", () => {
       );
 
       const text = Array.isArray(res) ? res[0]?.text : res?.text;
-      expect(text).toContain("Session: agent:main:whatsapp:group:G1");
+      expect(text).toContain("Session: agent:main:whatsapp:group:g1");
       expect(text).toContain("anthropic/claude-opus-4-5");
       expect(runEmbeddedPiAgent).not.toHaveBeenCalled();
     });
@@ -207,6 +211,7 @@ describe("RawBody directive parsing", () => {
         From: "+1222",
         To: "+1222",
         ChatType: "group",
+        CommandAuthorized: true,
       };
 
       const res = await getReplyFromConfig(
@@ -216,7 +221,7 @@ describe("RawBody directive parsing", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "clawd"),
+              workspace: path.join(home, "openclaw"),
             },
           },
           channels: { whatsapp: { allowFrom: ["*"] } },

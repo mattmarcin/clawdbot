@@ -12,8 +12,17 @@ const _makeFile = (overrides: Partial<WorkspaceBootstrapFile>): WorkspaceBootstr
 describe("isAuthErrorMessage", () => {
   it("matches credential validation errors", () => {
     const samples = [
-      'No credentials found for profile "anthropic:claude-cli".',
+      'No credentials found for profile "anthropic:default".',
       "No API key found for profile openai.",
+    ];
+    for (const sample of samples) {
+      expect(isAuthErrorMessage(sample)).toBe(true);
+    }
+  });
+  it("matches OAuth refresh failures", () => {
+    const samples = [
+      "OAuth token refresh failed for anthropic: Failed to refresh OAuth token for anthropic. Please try again or re-authenticate.",
+      "Please re-authenticate to continue.",
     ];
     for (const sample of samples) {
       expect(isAuthErrorMessage(sample)).toBe(true);

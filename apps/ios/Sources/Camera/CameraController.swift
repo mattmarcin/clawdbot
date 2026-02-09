@@ -1,5 +1,5 @@
 import AVFoundation
-import ClawdbotKit
+import OpenClawKit
 import Foundation
 
 actor CameraController {
@@ -36,7 +36,7 @@ actor CameraController {
         }
     }
 
-    func snap(params: ClawdbotCameraSnapParams) async throws -> (
+    func snap(params: OpenClawCameraSnapParams) async throws -> (
         format: String,
         base64: String,
         width: Int,
@@ -44,7 +44,7 @@ actor CameraController {
     {
         let facing = params.facing ?? .front
         let format = params.format ?? .jpg
-        // Default to a reasonable max width to keep bridge payload sizes manageable.
+        // Default to a reasonable max width to keep gateway payload sizes manageable.
         // If you need the full-res photo, explicitly request a larger maxWidth.
         let maxWidth = params.maxWidth.flatMap { $0 > 0 ? $0 : nil } ?? 1600
         let quality = Self.clampQuality(params.quality)
@@ -109,7 +109,7 @@ actor CameraController {
             height: res.heightPx)
     }
 
-    func clip(params: ClawdbotCameraClipParams) async throws -> (
+    func clip(params: OpenClawCameraClipParams) async throws -> (
         format: String,
         base64: String,
         durationMs: Int,
@@ -160,14 +160,14 @@ actor CameraController {
         defer { session.stopRunning() }
         await Self.warmUpCaptureSession()
 
-        let movURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clawdbot-camera-\(UUID().uuidString).mov")
-        let mp4URL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clawdbot-camera-\(UUID().uuidString).mp4")
+        let movURL = FileManager().temporaryDirectory
+            .appendingPathComponent("openclaw-camera-\(UUID().uuidString).mov")
+        let mp4URL = FileManager().temporaryDirectory
+            .appendingPathComponent("openclaw-camera-\(UUID().uuidString).mp4")
 
         defer {
-            try? FileManager.default.removeItem(at: movURL)
-            try? FileManager.default.removeItem(at: mp4URL)
+            try? FileManager().removeItem(at: movURL)
+            try? FileManager().removeItem(at: mp4URL)
         }
 
         var delegate: MovieFileDelegate?
@@ -190,14 +190,7 @@ actor CameraController {
     }
 
     func listDevices() -> [CameraDeviceInfo] {
-        let types: [AVCaptureDevice.DeviceType] = [
-            .builtInWideAngleCamera,
-        ]
-        let session = AVCaptureDevice.DiscoverySession(
-            deviceTypes: types,
-            mediaType: .video,
-            position: .unspecified)
-        return session.devices.map { device in
+        return Self.discoverVideoDevices().map { device in
             CameraDeviceInfo(
                 id: device.uniqueID,
                 name: device.localizedName,
@@ -228,11 +221,11 @@ actor CameraController {
     }
 
     private nonisolated static func pickCamera(
-        facing: ClawdbotCameraFacing,
+        facing: OpenClawCameraFacing,
         deviceId: String?) -> AVCaptureDevice?
     {
         if let deviceId, !deviceId.isEmpty {
-            if let match = AVCaptureDevice.devices(for: .video).first(where: { $0.uniqueID == deviceId }) {
+            if let match = Self.discoverVideoDevices().first(where: { $0.uniqueID == deviceId }) {
                 return match
             }
         }
@@ -252,6 +245,24 @@ actor CameraController {
         }
     }
 
+    private nonisolated static func discoverVideoDevices() -> [AVCaptureDevice] {
+        let types: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .builtInUltraWideCamera,
+            .builtInTelephotoCamera,
+            .builtInDualCamera,
+            .builtInDualWideCamera,
+            .builtInTripleCamera,
+            .builtInTrueDepthCamera,
+            .builtInLiDARDepthCamera,
+        ]
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: .video,
+            position: .unspecified)
+        return session.devices
+    }
+
     nonisolated static func clampQuality(_ quality: Double?) -> Double {
         let q = quality ?? 0.9
         return min(1.0, max(0.05, q))
@@ -259,7 +270,7 @@ actor CameraController {
 
     nonisolated static func clampDurationMs(_ ms: Int?) -> Int {
         let v = ms ?? 3000
-        // Keep clips short by default; avoid huge base64 payloads on the bridge.
+        // Keep clips short by default; avoid huge base64 payloads on the gateway.
         return min(60000, max(250, v))
     }
 

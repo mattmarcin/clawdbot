@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-
 import {
   SANDBOX_BROWSER_REGISTRY_PATH,
   SANDBOX_REGISTRY_PATH,
@@ -12,6 +11,7 @@ export type SandboxRegistryEntry = {
   createdAtMs: number;
   lastUsedAtMs: number;
   image: string;
+  configHash?: string;
 };
 
 type SandboxRegistry = {
@@ -36,7 +36,9 @@ export async function readRegistry(): Promise<SandboxRegistry> {
   try {
     const raw = await fs.readFile(SANDBOX_REGISTRY_PATH, "utf-8");
     const parsed = JSON.parse(raw) as SandboxRegistry;
-    if (parsed && Array.isArray(parsed.entries)) return parsed;
+    if (parsed && Array.isArray(parsed.entries)) {
+      return parsed;
+    }
   } catch {
     // ignore
   }
@@ -56,6 +58,7 @@ export async function updateRegistry(entry: SandboxRegistryEntry) {
     ...entry,
     createdAtMs: existing?.createdAtMs ?? entry.createdAtMs,
     image: existing?.image ?? entry.image,
+    configHash: entry.configHash ?? existing?.configHash,
   });
   await writeRegistry({ entries: next });
 }
@@ -63,7 +66,9 @@ export async function updateRegistry(entry: SandboxRegistryEntry) {
 export async function removeRegistryEntry(containerName: string) {
   const registry = await readRegistry();
   const next = registry.entries.filter((item) => item.containerName !== containerName);
-  if (next.length === registry.entries.length) return;
+  if (next.length === registry.entries.length) {
+    return;
+  }
   await writeRegistry({ entries: next });
 }
 
@@ -71,7 +76,9 @@ export async function readBrowserRegistry(): Promise<SandboxBrowserRegistry> {
   try {
     const raw = await fs.readFile(SANDBOX_BROWSER_REGISTRY_PATH, "utf-8");
     const parsed = JSON.parse(raw) as SandboxBrowserRegistry;
-    if (parsed && Array.isArray(parsed.entries)) return parsed;
+    if (parsed && Array.isArray(parsed.entries)) {
+      return parsed;
+    }
   } catch {
     // ignore
   }
@@ -102,6 +109,8 @@ export async function updateBrowserRegistry(entry: SandboxBrowserRegistryEntry) 
 export async function removeBrowserRegistryEntry(containerName: string) {
   const registry = await readBrowserRegistry();
   const next = registry.entries.filter((item) => item.containerName !== containerName);
-  if (next.length === registry.entries.length) return;
+  if (next.length === registry.entries.length) {
+    return;
+  }
   await writeBrowserRegistry({ entries: next });
 }

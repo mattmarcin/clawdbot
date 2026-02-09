@@ -1,9 +1,12 @@
 import { callGatewayTool, type GatewayCallOptions } from "./gateway.js";
 
-type NodeListNode = {
+export type NodeListNode = {
   nodeId: string;
   displayName?: string;
   platform?: string;
+  version?: string;
+  coreVersion?: string;
+  uiVersion?: string;
   remoteIp?: string;
   deviceFamily?: string;
   modelIdentifier?: string;
@@ -20,6 +23,8 @@ type PendingRequest = {
   displayName?: string;
   platform?: string;
   version?: string;
+  coreVersion?: string;
+  uiVersion?: string;
   remoteIp?: string;
   isRepair?: boolean;
   ts: number;
@@ -31,6 +36,8 @@ type PairedNode = {
   displayName?: string;
   platform?: string;
   version?: string;
+  coreVersion?: string;
+  uiVersion?: string;
   remoteIp?: string;
   permissions?: Record<string, boolean>;
   createdAtMs?: number;
@@ -64,10 +71,10 @@ function normalizeNodeKey(value: string) {
 
 async function loadNodes(opts: GatewayCallOptions): Promise<NodeListNode[]> {
   try {
-    const res = (await callGatewayTool("node.list", opts, {})) as unknown;
+    const res = await callGatewayTool("node.list", opts, {});
     return parseNodeList(res);
   } catch {
-    const res = (await callGatewayTool("node.pair.list", opts, {})) as unknown;
+    const res = await callGatewayTool("node.pair.list", opts, {});
     const { paired } = parsePairingList(res);
     return paired.map((n) => ({
       nodeId: n.nodeId,
@@ -82,11 +89,15 @@ function pickDefaultNode(nodes: NodeListNode[]): NodeListNode | null {
   const withCanvas = nodes.filter((n) =>
     Array.isArray(n.caps) ? n.caps.includes("canvas") : true,
   );
-  if (withCanvas.length === 0) return null;
+  if (withCanvas.length === 0) {
+    return null;
+  }
 
   const connected = withCanvas.filter((n) => n.connected);
   const candidates = connected.length > 0 ? connected : withCanvas;
-  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
 
   const local = candidates.filter(
     (n) =>
@@ -94,37 +105,54 @@ function pickDefaultNode(nodes: NodeListNode[]): NodeListNode | null {
       typeof n.nodeId === "string" &&
       n.nodeId.startsWith("mac-"),
   );
-  if (local.length === 1) return local[0];
+  if (local.length === 1) {
+    return local[0];
+  }
 
   return null;
 }
 
-export async function resolveNodeId(
-  opts: GatewayCallOptions,
+export async function listNodes(opts: GatewayCallOptions): Promise<NodeListNode[]> {
+  return loadNodes(opts);
+}
+
+export function resolveNodeIdFromList(
+  nodes: NodeListNode[],
   query?: string,
   allowDefault = false,
-) {
-  const nodes = await loadNodes(opts);
+): string {
   const q = String(query ?? "").trim();
   if (!q) {
     if (allowDefault) {
       const picked = pickDefaultNode(nodes);
-      if (picked) return picked.nodeId;
+      if (picked) {
+        return picked.nodeId;
+      }
     }
     throw new Error("node required");
   }
 
   const qNorm = normalizeNodeKey(q);
   const matches = nodes.filter((n) => {
-    if (n.nodeId === q) return true;
-    if (typeof n.remoteIp === "string" && n.remoteIp === q) return true;
+    if (n.nodeId === q) {
+      return true;
+    }
+    if (typeof n.remoteIp === "string" && n.remoteIp === q) {
+      return true;
+    }
     const name = typeof n.displayName === "string" ? n.displayName : "";
-    if (name && normalizeNodeKey(name) === qNorm) return true;
-    if (q.length >= 6 && n.nodeId.startsWith(q)) return true;
+    if (name && normalizeNodeKey(name) === qNorm) {
+      return true;
+    }
+    if (q.length >= 6 && n.nodeId.startsWith(q)) {
+      return true;
+    }
     return false;
   });
 
-  if (matches.length === 1) return matches[0].nodeId;
+  if (matches.length === 1) {
+    return matches[0].nodeId;
+  }
   if (matches.length === 0) {
     const known = nodes
       .map((n) => n.displayName || n.remoteIp || n.nodeId)
@@ -137,4 +165,13 @@ export async function resolveNodeId(
       .map((n) => n.displayName || n.remoteIp || n.nodeId)
       .join(", ")})`,
   );
+}
+
+export async function resolveNodeId(
+  opts: GatewayCallOptions,
+  query?: string,
+  allowDefault = false,
+) {
+  const nodes = await loadNodes(opts);
+  return resolveNodeIdFromList(nodes, query, allowDefault);
 }

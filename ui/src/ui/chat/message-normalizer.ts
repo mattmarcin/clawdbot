@@ -2,10 +2,7 @@
  * Message normalization utilities for chat rendering.
  */
 
-import type {
-  NormalizedMessage,
-  MessageContentItem,
-} from "../types/chat-types";
+import type { NormalizedMessage, MessageContentItem } from "../types/chat-types.ts";
 
 /**
  * Normalize a raw message object into a consistent structure.
@@ -14,8 +11,23 @@ export function normalizeMessage(message: unknown): NormalizedMessage {
   const m = message as Record<string, unknown>;
   let role = typeof m.role === "string" ? m.role : "unknown";
 
-  // Detect tool result messages by presence of toolCallId or tool_call_id
-  if (typeof m.toolCallId === "string" || typeof m.tool_call_id === "string") {
+  // Detect tool messages by common gateway shapes.
+  // Some tool events come through as assistant role with tool_* items in the content array.
+  const hasToolId = typeof m.toolCallId === "string" || typeof m.tool_call_id === "string";
+
+  const contentRaw = m.content;
+  const contentItems = Array.isArray(contentRaw) ? contentRaw : null;
+  const hasToolContent =
+    Array.isArray(contentItems) &&
+    contentItems.some((item) => {
+      const x = item as Record<string, unknown>;
+      const t = (typeof x.type === "string" ? x.type : "").toLowerCase();
+      return t === "toolresult" || t === "tool_result";
+    });
+
+  const hasToolName = typeof m.toolName === "string" || typeof m.tool_name === "string";
+
+  if (hasToolId || hasToolContent || hasToolName) {
     role = "toolResult";
   }
 
@@ -43,18 +55,27 @@ export function normalizeMessage(message: unknown): NormalizedMessage {
 
 /**
  * Normalize role for grouping purposes.
- * Tool results should be grouped with assistant messages.
  */
 export function normalizeRoleForGrouping(role: string): string {
   const lower = role.toLowerCase();
-  // All tool-related roles should display as assistant
+  // Preserve original casing when it's already a core role.
+  if (role === "user" || role === "User") {
+    return role;
+  }
+  if (role === "assistant") {
+    return "assistant";
+  }
+  if (role === "system") {
+    return "system";
+  }
+  // Keep tool-related roles distinct so the UI can style/toggle them.
   if (
     lower === "toolresult" ||
     lower === "tool_result" ||
     lower === "tool" ||
     lower === "function"
   ) {
-    return "assistant";
+    return "tool";
   }
   return role;
 }

@@ -1,5 +1,4 @@
 import type { Server } from "node:http";
-
 import type { RunningChrome } from "./chrome.js";
 import type { BrowserTab } from "./client.js";
 import type { ResolvedBrowserConfig, ResolvedBrowserProfile } from "./config.js";
@@ -12,10 +11,12 @@ export type { BrowserTab };
 export type ProfileRuntimeState = {
   profile: ResolvedBrowserProfile;
   running: RunningChrome | null;
+  /** Sticky tab selection when callers omit targetId (keeps snapshot+act consistent). */
+  lastTargetId?: string | null;
 };
 
 export type BrowserServerState = {
-  server: Server;
+  server?: Server | null;
   port: number;
   resolved: ResolvedBrowserConfig;
   profiles: Map<string, ProfileRuntimeState>;

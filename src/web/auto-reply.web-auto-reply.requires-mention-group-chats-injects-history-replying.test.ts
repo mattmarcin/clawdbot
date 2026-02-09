@@ -46,7 +46,7 @@ const rmDirWithRetries = async (dir: string): Promise<void> => {
 beforeEach(async () => {
   resetInboundDedupe();
   previousHome = process.env.HOME;
-  tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-web-home-"));
+  tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-web-home-"));
   process.env.HOME = tempHome;
 });
 
@@ -61,7 +61,7 @@ afterEach(async () => {
 const _makeSessionStore = async (
   entries: Record<string, unknown> = {},
 ): Promise<{ storePath: string; cleanup: () => Promise<void> }> => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-session-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-"));
   const storePath = path.join(dir, "sessions.json");
   await fs.writeFile(storePath, JSON.stringify(entries));
   const cleanup = async () => {
@@ -166,7 +166,147 @@ describe("web auto-reply", () => {
     expect(payload.Body).toContain("Alice (+111): hello group");
     expect(payload.Body).toContain("[message_id: g1]");
     expect(payload.Body).toContain("@bot ping");
-    expect(payload.Body).toContain("[from: Bob (+222)]");
+    expect(payload.SenderName).toBe("Bob");
+    expect(payload.SenderE164).toBe("+222");
+    expect(payload.SenderId).toBe("+222");
+  });
+
+  it("bypasses mention gating for owner /new in group chats", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (msg: import("./inbound.js").WebInboundMessage) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    setLoadConfigMock(() => ({
+      channels: {
+        whatsapp: {
+          allowFrom: ["+111"],
+        },
+      },
+    }));
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "/new",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g-new",
+      senderE164: "+111",
+      senderName: "Owner",
+      selfE164: "+999",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not bypass mention gating for non-owner /new in group chats", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (msg: import("./inbound.js").WebInboundMessage) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    setLoadConfigMock(() => ({
+      channels: {
+        whatsapp: {
+          allowFrom: ["+999"],
+        },
+      },
+    }));
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "/new",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g-new-unauth",
+      senderE164: "+111",
+      senderName: "NotOwner",
+      selfE164: "+999",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it("bypasses mention gating for owner /status in group chats", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (msg: import("./inbound.js").WebInboundMessage) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    setLoadConfigMock(() => ({
+      channels: {
+        whatsapp: {
+          allowFrom: ["+111"],
+        },
+      },
+    }));
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "/status",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g-status",
+      senderE164: "+111",
+      senderName: "Owner",
+      selfE164: "+999",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(1);
   });
 
   it("passes conversation id through as From for group replies", async () => {
@@ -226,7 +366,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    const authDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-wa-auth-"));
+    const authDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-wa-auth-"));
 
     try {
       await fs.writeFile(
@@ -304,7 +444,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    const authDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-wa-auth-"));
+    const authDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-wa-auth-"));
 
     try {
       await fs.writeFile(

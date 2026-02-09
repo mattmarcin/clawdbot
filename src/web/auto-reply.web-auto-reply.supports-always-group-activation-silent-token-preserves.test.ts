@@ -14,6 +14,7 @@ vi.mock("../agents/pi-embedded.js", () => ({
   resolveEmbeddedSessionLane: (key: string) => `session:${key.trim() || "main"}`,
 }));
 
+import { expectInboundContextContract } from "../../test/helpers/inbound-contract.js";
 import { resetInboundDedupe } from "../auto-reply/reply/inbound-dedupe.js";
 import { resetLogger, setLoggerOverride } from "../logging.js";
 import { monitorWebChannel, SILENT_REPLY_TOKEN } from "./auto-reply.js";
@@ -47,7 +48,7 @@ const rmDirWithRetries = async (dir: string): Promise<void> => {
 beforeEach(async () => {
   resetInboundDedupe();
   previousHome = process.env.HOME;
-  tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-web-home-"));
+  tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-web-home-"));
   process.env.HOME = tempHome;
 });
 
@@ -62,7 +63,7 @@ afterEach(async () => {
 const makeSessionStore = async (
   entries: Record<string, unknown> = {},
 ): Promise<{ storePath: string; cleanup: () => Promise<void> }> => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-session-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-"));
   const storePath = path.join(dir, "sessions.json");
   await fs.writeFile(storePath, JSON.stringify(entries));
   const cleanup = async () => {
@@ -106,7 +107,7 @@ describe("web auto-reply", () => {
     vi.useRealTimers();
   });
 
-  it("supports always-on group activation with silent token and preserves history", async () => {
+  it("supports always-on group activation with silent token and clears pending history", async () => {
     const sendMedia = vi.fn();
     const reply = vi.fn().mockResolvedValue(undefined);
     const sendComposing = vi.fn();
@@ -125,7 +126,7 @@ describe("web auto-reply", () => {
 
     setLoadConfigMock(() => ({
       messages: {
-        groupChat: { mentionPatterns: ["@clawd"] },
+        groupChat: { mentionPatterns: ["@openclaw"] },
       },
       session: { store: storePath },
     }));
@@ -180,10 +181,13 @@ describe("web auto-reply", () => {
 
     expect(resolver).toHaveBeenCalledTimes(2);
     const payload = resolver.mock.calls[1][0];
-    expect(payload.Body).toContain("Chat messages since your last reply");
-    expect(payload.Body).toContain("Alice (+111): first");
-    expect(payload.Body).toContain("[message_id: g-always-1]");
-    expect(payload.Body).toContain("Bob: second");
+    expect(payload.Body).not.toContain("Chat messages since your last reply");
+    expect(payload.Body).not.toContain("Alice (+111): first");
+    expect(payload.Body).not.toContain("[message_id: g-always-1]");
+    expect(payload.Body).toContain("second");
+    expectInboundContextContract(payload);
+    expect(payload.SenderName).toBe("Bob");
+    expect(payload.SenderE164).toBe("+222");
     expect(reply).toHaveBeenCalledTimes(1);
 
     await cleanup();
@@ -205,7 +209,7 @@ describe("web auto-reply", () => {
       },
       messages: {
         groupChat: {
-          mentionPatterns: ["\\bclawd\\b"],
+          mentionPatterns: ["\\bopenclaw\\b"],
         },
       },
     }));
@@ -244,9 +248,9 @@ describe("web auto-reply", () => {
 
     expect(resolver).not.toHaveBeenCalled();
 
-    // Text-based mentionPatterns still work (user can type "clawd" explicitly).
+    // Text-based mentionPatterns still work (user can type "openclaw" explicitly).
     await capturedOnMessage?.({
-      body: "clawd ping",
+      body: "openclaw ping",
       from: "123@g.us",
       conversationId: "123@g.us",
       chatId: "123@g.us",
@@ -268,7 +272,7 @@ describe("web auto-reply", () => {
   });
   it("emits heartbeat logs with connection metadata", async () => {
     vi.useFakeTimers();
-    const logPath = `/tmp/clawdbot-heartbeat-${crypto.randomUUID()}.log`;
+    const logPath = `/tmp/openclaw-heartbeat-${crypto.randomUUID()}.log`;
     setLoggerOverride({ level: "trace", file: logPath });
 
     const runtime = {
@@ -309,7 +313,7 @@ describe("web auto-reply", () => {
     expect(content).toMatch(/messagesHandled/);
   });
   it("logs outbound replies to file", async () => {
-    const logPath = `/tmp/clawdbot-log-test-${crypto.randomUUID()}.log`;
+    const logPath = `/tmp/openclaw-log-test-${crypto.randomUUID()}.log`;
     setLoggerOverride({ level: "trace", file: logPath });
 
     let capturedOnMessage:

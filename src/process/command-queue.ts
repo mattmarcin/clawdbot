@@ -1,3 +1,6 @@
+import { diagnosticLogger as diag, logLaneDequeue, logLaneEnqueue } from "../logging/diagnostic.js";
+import { CommandLane } from "./lanes.js";
+
 // Minimal in-process queue to serialize command executions.
 // Default lane ("main") preserves the existing behavior. Additional lanes allow
 // low-risk parallelism (e.g. cron jobs) without interleaving stdin / logs for
@@ -24,7 +27,9 @@ const lanes = new Map<string, LaneState>();
 
 function getLaneState(lane: string): LaneState {
   const existing = lanes.get(lane);
-  if (existing) return existing;
+  if (existing) {
+    return existing;
+  }
   const created: LaneState = {
     lane,
     queue: [],
@@ -38,7 +43,9 @@ function getLaneState(lane: string): LaneState {
 
 function drainLane(lane: string) {
   const state = getLaneState(lane);
-  if (state.draining) return;
+  if (state.draining) {
+    return;
+  }
   state.draining = true;
 
   const pump = () => {
@@ -47,16 +54,30 @@ function drainLane(lane: string) {
       const waitedMs = Date.now() - entry.enqueuedAt;
       if (waitedMs >= entry.warnAfterMs) {
         entry.onWait?.(waitedMs, state.queue.length);
+        diag.warn(
+          `lane wait exceeded: lane=${lane} waitedMs=${waitedMs} queueAhead=${state.queue.length}`,
+        );
       }
+      logLaneDequeue(lane, waitedMs, state.queue.length);
       state.active += 1;
       void (async () => {
+        const startTime = Date.now();
         try {
           const result = await entry.task();
           state.active -= 1;
+          diag.debug(
+            `lane task done: lane=${lane} durationMs=${Date.now() - startTime} active=${state.active} queued=${state.queue.length}`,
+          );
           pump();
           entry.resolve(result);
         } catch (err) {
           state.active -= 1;
+          const isProbeLane = lane.startsWith("auth-probe:") || lane.startsWith("session:probe-");
+          if (!isProbeLane) {
+            diag.error(
+              `lane task error: lane=${lane} durationMs=${Date.now() - startTime} error="${String(err)}"`,
+            );
+          }
           pump();
           entry.reject(err);
         }
@@ -69,7 +90,7 @@ function drainLane(lane: string) {
 }
 
 export function setCommandLaneConcurrency(lane: string, maxConcurrent: number) {
-  const cleaned = lane.trim() || "main";
+  const cleaned = lane.trim() || CommandLane.Main;
   const state = getLaneState(cleaned);
   state.maxConcurrent = Math.max(1, Math.floor(maxConcurrent));
   drainLane(cleaned);
@@ -83,7 +104,7 @@ export function enqueueCommandInLane<T>(
     onWait?: (waitMs: number, queuedAhead: number) => void;
   },
 ): Promise<T> {
-  const cleaned = lane.trim() || "main";
+  const cleaned = lane.trim() || CommandLane.Main;
   const warnAfterMs = opts?.warnAfterMs ?? 2_000;
   const state = getLaneState(cleaned);
   return new Promise<T>((resolve, reject) => {
@@ -95,6 +116,7 @@ export function enqueueCommandInLane<T>(
       warnAfterMs,
       onWait: opts?.onWait,
     });
+    logLaneEnqueue(cleaned, state.queue.length + state.active);
     drainLane(cleaned);
   });
 }
@@ -106,12 +128,15 @@ export function enqueueCommand<T>(
     onWait?: (waitMs: number, queuedAhead: number) => void;
   },
 ): Promise<T> {
-  return enqueueCommandInLane("main", task, opts);
+  return enqueueCommandInLane(CommandLane.Main, task, opts);
 }
 
-export function getQueueSize(lane = "main") {
-  const state = lanes.get(lane);
-  if (!state) return 0;
+export function getQueueSize(lane: string = CommandLane.Main) {
+  const resolved = lane.trim() || CommandLane.Main;
+  const state = lanes.get(resolved);
+  if (!state) {
+    return 0;
+  }
   return state.queue.length + state.active;
 }
 
@@ -123,10 +148,12 @@ export function getTotalQueueSize() {
   return total;
 }
 
-export function clearCommandLane(lane = "main") {
-  const cleaned = lane.trim() || "main";
+export function clearCommandLane(lane: string = CommandLane.Main) {
+  const cleaned = lane.trim() || CommandLane.Main;
   const state = lanes.get(cleaned);
-  if (!state) return 0;
+  if (!state) {
+    return 0;
+  }
   const removed = state.queue.length;
   state.queue.length = 0;
   return removed;

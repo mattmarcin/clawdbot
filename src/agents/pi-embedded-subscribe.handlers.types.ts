@@ -1,16 +1,24 @@
 import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
-
+import type { ReplyDirectiveParseResult } from "../auto-reply/reply/reply-directives.js";
 import type { ReasoningLevel } from "../auto-reply/thinking.js";
+import type { InlineCodeState } from "../markdown/code-spans.js";
 import type { EmbeddedBlockChunker } from "./pi-embedded-block-chunker.js";
 import type { MessagingToolSend } from "./pi-embedded-messaging.js";
 import type {
   BlockReplyChunking,
   SubscribeEmbeddedPiSessionParams,
 } from "./pi-embedded-subscribe.types.js";
+import type { NormalizedUsage } from "./usage.js";
 
 export type EmbeddedSubscribeLogger = {
   debug: (message: string) => void;
   warn: (message: string) => void;
+};
+
+export type ToolErrorSummary = {
+  toolName: string;
+  meta?: string;
+  error?: string;
 };
 
 export type EmbeddedPiSubscribeState = {
@@ -18,6 +26,7 @@ export type EmbeddedPiSubscribeState = {
   toolMetas: Array<{ toolName?: string; meta?: string }>;
   toolMetaById: Map<string, string | undefined>;
   toolSummaryById: Set<string>;
+  lastToolError?: ToolErrorSummary;
 
   blockReplyBreak: "text_end" | "message_end";
   reasoningMode: ReasoningLevel;
@@ -27,10 +36,17 @@ export type EmbeddedPiSubscribeState = {
 
   deltaBuffer: string;
   blockBuffer: string;
-  blockState: { thinking: boolean; final: boolean };
+  blockState: { thinking: boolean; final: boolean; inlineCode: InlineCodeState };
+  partialBlockState: { thinking: boolean; final: boolean; inlineCode: InlineCodeState };
   lastStreamedAssistant?: string;
+  lastStreamedAssistantCleaned?: string;
+  emittedAssistantUpdate: boolean;
   lastStreamedReasoning?: string;
   lastBlockReplyText?: string;
+  assistantMessageIndex: number;
+  lastAssistantTextMessageIndex: number;
+  lastAssistantTextNormalized?: string;
+  lastAssistantTextTrimmed?: string;
   assistantTextBaseline: number;
   suppressBlockChunks: boolean;
   lastReasoningSent?: string;
@@ -55,11 +71,24 @@ export type EmbeddedPiSubscribeContext = {
   blockChunker: EmbeddedBlockChunker | null;
 
   shouldEmitToolResult: () => boolean;
+  shouldEmitToolOutput: () => boolean;
   emitToolSummary: (toolName?: string, meta?: string) => void;
-  stripBlockTags: (text: string, state: { thinking: boolean; final: boolean }) => string;
+  emitToolOutput: (toolName?: string, meta?: string, output?: string) => void;
+  stripBlockTags: (
+    text: string,
+    state: { thinking: boolean; final: boolean; inlineCode?: InlineCodeState },
+  ) => string;
   emitBlockChunk: (text: string) => void;
   flushBlockReplyBuffer: () => void;
   emitReasoningStream: (text: string) => void;
+  consumeReplyDirectives: (
+    text: string,
+    options?: { final?: boolean },
+  ) => ReplyDirectiveParseResult | null;
+  consumePartialReplyDirectives: (
+    text: string,
+    options?: { final?: boolean },
+  ) => ReplyDirectiveParseResult | null;
   resetAssistantMessageState: (nextAssistantTextBaseline: number) => void;
   resetForCompactionRetry: () => void;
   finalizeAssistantTexts: (args: {
@@ -72,6 +101,10 @@ export type EmbeddedPiSubscribeContext = {
   noteCompactionRetry: () => void;
   resolveCompactionRetry: () => void;
   maybeResolveCompactionWait: () => void;
+  recordAssistantUsage: (usage: unknown) => void;
+  incrementCompactionCount: () => void;
+  getUsageTotals: () => NormalizedUsage | undefined;
+  getCompactionCount: () => number;
 };
 
 export type EmbeddedPiSubscribeEvent =

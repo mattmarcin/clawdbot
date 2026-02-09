@@ -1,17 +1,32 @@
+import type { HeartbeatEventPayload } from "../infra/heartbeat-events.js";
+import type { RuntimeEnv } from "../runtime.js";
+import { formatCliCommand } from "../cli/command-format.js";
 import { withProgress } from "../cli/progress.js";
 import { resolveGatewayPort } from "../config/config.js";
 import { buildGatewayConnectionDetails, callGateway } from "../gateway/call.js";
 import { info } from "../globals.js";
+import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 import { formatUsageReportLines, loadProviderUsageSummary } from "../infra/provider-usage.js";
-import type { RuntimeEnv } from "../runtime.js";
+import {
+  formatUpdateChannelLabel,
+  normalizeUpdateChannel,
+  resolveEffectiveUpdateChannel,
+} from "../infra/update-channels.js";
+import {
+  resolveMemoryCacheSummary,
+  resolveMemoryFtsState,
+  resolveMemoryVectorState,
+  type Tone,
+} from "../memory/status-format.js";
 import { runSecurityAudit } from "../security/audit.js";
 import { renderTable } from "../terminal/table.js";
 import { theme } from "../terminal/theme.js";
 import { formatHealthChannelLines, type HealthSummary } from "./health.js";
 import { resolveControlUiLinks } from "./onboard-helpers.js";
-import { getDaemonStatusSummary } from "./status.daemon.js";
+import { statusAllCommand } from "./status-all.js";
+import { formatGatewayAuthUsed } from "./status-all/format.js";
+import { getDaemonStatusSummary, getNodeDaemonStatusSummary } from "./status.daemon.js";
 import {
-  formatAge,
   formatDuration,
   formatKTokens,
   formatTokensCompact,
@@ -19,9 +34,11 @@ import {
 } from "./status.format.js";
 import { resolveGatewayProbeAuth } from "./status.gateway-probe.js";
 import { scanStatus } from "./status.scan.js";
-import { formatUpdateOneLiner } from "./status.update.js";
-import { formatGatewayAuthUsed } from "./status-all/format.js";
-import { statusAllCommand } from "./status-all.js";
+import {
+  formatUpdateAvailableHint,
+  formatUpdateOneLiner,
+  resolveUpdateAvailability,
+} from "./status.update.js";
 
 export async function statusCommand(
   opts: {
@@ -60,6 +77,8 @@ export async function statusCommand(
     agentStatus,
     channels,
     summary,
+    memory,
+    memoryPlugin,
   } = scan;
 
   const securityAudit = await withProgress(
@@ -97,18 +116,42 @@ export async function statusCommand(
         async () =>
           await callGateway<HealthSummary>({
             method: "health",
+            params: { probe: true },
             timeoutMs: opts.timeoutMs,
           }),
       )
     : undefined;
+  const lastHeartbeat =
+    opts.deep && gatewayReachable
+      ? await callGateway<HeartbeatEventPayload | null>({
+          method: "last-heartbeat",
+          params: {},
+          timeoutMs: opts.timeoutMs,
+        }).catch(() => null)
+      : null;
+
+  const configChannel = normalizeUpdateChannel(cfg.update?.channel);
+  const channelInfo = resolveEffectiveUpdateChannel({
+    configChannel,
+    installKind: update.installKind,
+    git: update.git ? { tag: update.git.tag, branch: update.git.branch } : undefined,
+  });
 
   if (opts.json) {
+    const [daemon, nodeDaemon] = await Promise.all([
+      getDaemonStatusSummary(),
+      getNodeDaemonStatusSummary(),
+    ]);
     runtime.log(
       JSON.stringify(
         {
           ...summary,
           os: osSummary,
           update,
+          updateChannel: channelInfo.channel,
+          updateChannelSource: channelInfo.source,
+          memory,
+          memoryPlugin,
           gateway: {
             mode: gatewayMode,
             url: gatewayConnection.url,
@@ -119,9 +162,11 @@ export async function statusCommand(
             self: gatewaySelf,
             error: gatewayProbe?.error ?? null,
           },
+          gatewayService: daemon,
+          nodeService: nodeDaemon,
           agents: agentStatus,
           securityAudit,
-          ...(health || usage ? { health, usage } : {}),
+          ...(health || usage || lastHeartbeat ? { health, usage, lastHeartbeat } : {}),
         },
         null,
         2,
@@ -138,7 +183,9 @@ export async function statusCommand(
   if (opts.verbose) {
     const details = buildGatewayConnectionDetails();
     runtime.log(info("Gateway connection:"));
-    for (const line of details.message.split("\n")) runtime.log(`  ${line}`);
+    for (const line of details.message.split("\n")) {
+      runtime.log(`  ${line}`);
+    }
     runtime.log("");
   }
 
@@ -146,7 +193,9 @@ export async function statusCommand(
 
   const dashboard = (() => {
     const controlUiEnabled = cfg.gateway?.controlUi?.enabled ?? true;
-    if (!controlUiEnabled) return "disabled";
+    if (!controlUiEnabled) {
+      return "disabled";
+    }
     const links = resolveControlUiLinks({
       port: resolveGatewayPort(cfg),
       bind: cfg.gateway?.bind,
@@ -190,16 +239,28 @@ export async function statusCommand(
         ? `${agentStatus.bootstrapPendingCount} bootstrapping`
         : "no bootstraps";
     const def = agentStatus.agents.find((a) => a.id === agentStatus.defaultId);
-    const defActive = def?.lastActiveAgeMs != null ? formatAge(def.lastActiveAgeMs) : "unknown";
+    const defActive = def?.lastActiveAgeMs != null ? formatTimeAgo(def.lastActiveAgeMs) : "unknown";
     const defSuffix = def ? ` · default ${def.id} active ${defActive}` : "";
     return `${agentStatus.agents.length} · ${pending} · sessions ${agentStatus.totalSessions}${defSuffix}`;
   })();
 
-  const daemon = await getDaemonStatusSummary();
+  const [daemon, nodeDaemon] = await Promise.all([
+    getDaemonStatusSummary(),
+    getNodeDaemonStatusSummary(),
+  ]);
   const daemonValue = (() => {
-    if (daemon.installed === false) return `${daemon.label} not installed`;
+    if (daemon.installed === false) {
+      return `${daemon.label} not installed`;
+    }
     const installedPrefix = daemon.installed === true ? "installed · " : "";
     return `${daemon.label} ${installedPrefix}${daemon.loadedText}${daemon.runtimeShort ? ` · ${daemon.runtimeShort}` : ""}`;
+  })();
+  const nodeDaemonValue = (() => {
+    if (nodeDaemon.installed === false) {
+      return `${nodeDaemon.label} not installed`;
+    }
+    const installedPrefix = nodeDaemon.installed === true ? "installed · " : "";
+    return `${nodeDaemon.label} ${installedPrefix}${nodeDaemon.loadedText}${nodeDaemon.runtimeShort ? ` · ${nodeDaemon.runtimeShort}` : ""}`;
   })();
 
   const defaults = summary.sessions.defaults;
@@ -210,6 +271,103 @@ export async function statusCommand(
     summary.queuedSystemEvents.length > 0 ? `${summary.queuedSystemEvents.length} queued` : "none";
 
   const probesValue = health ? ok("enabled") : muted("skipped (use --deep)");
+
+  const heartbeatValue = (() => {
+    const parts = summary.heartbeat.agents
+      .map((agent) => {
+        if (!agent.enabled || !agent.everyMs) {
+          return `disabled (${agent.agentId})`;
+        }
+        const everyLabel = agent.every;
+        return `${everyLabel} (${agent.agentId})`;
+      })
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join(", ") : "disabled";
+  })();
+  const lastHeartbeatValue = (() => {
+    if (!opts.deep) {
+      return null;
+    }
+    if (!gatewayReachable) {
+      return warn("unavailable");
+    }
+    if (!lastHeartbeat) {
+      return muted("none");
+    }
+    const age = formatTimeAgo(Date.now() - lastHeartbeat.ts);
+    const channel = lastHeartbeat.channel ?? "unknown";
+    const accountLabel = lastHeartbeat.accountId ? `account ${lastHeartbeat.accountId}` : null;
+    return [lastHeartbeat.status, `${age} ago`, channel, accountLabel].filter(Boolean).join(" · ");
+  })();
+
+  const storeLabel =
+    summary.sessions.paths.length > 1
+      ? `${summary.sessions.paths.length} stores`
+      : (summary.sessions.paths[0] ?? "unknown");
+
+  const memoryValue = (() => {
+    if (!memoryPlugin.enabled) {
+      const suffix = memoryPlugin.reason ? ` (${memoryPlugin.reason})` : "";
+      return muted(`disabled${suffix}`);
+    }
+    if (!memory) {
+      const slot = memoryPlugin.slot ? `plugin ${memoryPlugin.slot}` : "plugin";
+      return muted(`enabled (${slot}) · unavailable`);
+    }
+    const parts: string[] = [];
+    const dirtySuffix = memory.dirty ? ` · ${warn("dirty")}` : "";
+    parts.push(`${memory.files} files · ${memory.chunks} chunks${dirtySuffix}`);
+    if (memory.sources?.length) {
+      parts.push(`sources ${memory.sources.join(", ")}`);
+    }
+    if (memoryPlugin.slot) {
+      parts.push(`plugin ${memoryPlugin.slot}`);
+    }
+    const colorByTone = (tone: Tone, text: string) =>
+      tone === "ok" ? ok(text) : tone === "warn" ? warn(text) : muted(text);
+    const vector = memory.vector;
+    if (vector) {
+      const state = resolveMemoryVectorState(vector);
+      const label = state.state === "disabled" ? "vector off" : `vector ${state.state}`;
+      parts.push(colorByTone(state.tone, label));
+    }
+    const fts = memory.fts;
+    if (fts) {
+      const state = resolveMemoryFtsState(fts);
+      const label = state.state === "disabled" ? "fts off" : `fts ${state.state}`;
+      parts.push(colorByTone(state.tone, label));
+    }
+    const cache = memory.cache;
+    if (cache) {
+      const summary = resolveMemoryCacheSummary(cache);
+      parts.push(colorByTone(summary.tone, summary.text));
+    }
+    return parts.join(" · ");
+  })();
+
+  const updateAvailability = resolveUpdateAvailability(update);
+  const updateLine = formatUpdateOneLiner(update).replace(/^Update:\s*/i, "");
+  const channelLabel = formatUpdateChannelLabel({
+    channel: channelInfo.channel,
+    source: channelInfo.source,
+    gitTag: update.git?.tag ?? null,
+    gitBranch: update.git?.branch ?? null,
+  });
+  const gitLabel =
+    update.installKind === "git"
+      ? (() => {
+          const shortSha = update.git?.sha ? update.git.sha.slice(0, 8) : null;
+          const branch =
+            update.git?.branch && update.git.branch !== "HEAD" ? update.git.branch : null;
+          const tag = update.git?.tag ?? null;
+          const parts = [
+            branch ?? (tag ? "detached" : "git"),
+            tag ? `tag ${tag}` : null,
+            shortSha ? `@ ${shortSha}` : null,
+          ].filter(Boolean);
+          return parts.join(" · ");
+        })()
+      : null;
 
   const overviewRows = [
     { Item: "Dashboard", Value: dashboard },
@@ -223,23 +381,28 @@ export async function statusCommand(
             ? `${tailscaleMode} · ${tailscaleDns} · ${tailscaleHttpsUrl}`
             : warn(`${tailscaleMode} · magicdns unknown`),
     },
+    { Item: "Channel", Value: channelLabel },
+    ...(gitLabel ? [{ Item: "Git", Value: gitLabel }] : []),
     {
       Item: "Update",
-      Value: formatUpdateOneLiner(update).replace(/^Update:\s*/i, ""),
+      Value: updateAvailability.available ? warn(`available · ${updateLine}`) : updateLine,
     },
     { Item: "Gateway", Value: gatewayValue },
-    { Item: "Daemon", Value: daemonValue },
+    { Item: "Gateway service", Value: daemonValue },
+    { Item: "Node service", Value: nodeDaemonValue },
     { Item: "Agents", Value: agentsValue },
+    { Item: "Memory", Value: memoryValue },
     { Item: "Probes", Value: probesValue },
     { Item: "Events", Value: eventsValue },
-    { Item: "Heartbeat", Value: `${summary.heartbeatSeconds}s` },
+    { Item: "Heartbeat", Value: heartbeatValue },
+    ...(lastHeartbeatValue ? [{ Item: "Last heartbeat", Value: lastHeartbeatValue }] : []),
     {
       Item: "Sessions",
-      Value: `${summary.sessions.count} active · default ${defaults.model ?? "unknown"}${defaultCtx} · store ${summary.sessions.path}`,
+      Value: `${summary.sessions.count} active · default ${defaults.model ?? "unknown"}${defaultCtx} · ${storeLabel}`,
     },
   ];
 
-  runtime.log(theme.heading("Clawdbot status"));
+  runtime.log(theme.heading("OpenClaw status"));
   runtime.log("");
   runtime.log(theme.heading("Overview"));
   runtime.log(
@@ -271,25 +434,33 @@ export async function statusCommand(
     runtime.log(theme.muted("No critical or warn findings detected."));
   } else {
     const severityLabel = (sev: "critical" | "warn" | "info") => {
-      if (sev === "critical") return theme.error("CRITICAL");
-      if (sev === "warn") return theme.warn("WARN");
+      if (sev === "critical") {
+        return theme.error("CRITICAL");
+      }
+      if (sev === "warn") {
+        return theme.warn("WARN");
+      }
       return theme.muted("INFO");
     };
     const sevRank = (sev: "critical" | "warn" | "info") =>
       sev === "critical" ? 0 : sev === "warn" ? 1 : 2;
-    const sorted = [...importantFindings].sort((a, b) => sevRank(a.severity) - sevRank(b.severity));
+    const sorted = [...importantFindings].toSorted(
+      (a, b) => sevRank(a.severity) - sevRank(b.severity),
+    );
     const shown = sorted.slice(0, 6);
     for (const f of shown) {
       runtime.log(`  ${severityLabel(f.severity)} ${f.title}`);
       runtime.log(`    ${shortenText(f.detail.replaceAll("\n", " "), 160)}`);
-      if (f.remediation?.trim()) runtime.log(`    ${theme.muted(`Fix: ${f.remediation.trim()}`)}`);
+      if (f.remediation?.trim()) {
+        runtime.log(`    ${theme.muted(`Fix: ${f.remediation.trim()}`)}`);
+      }
     }
     if (sorted.length > shown.length) {
       runtime.log(theme.muted(`… +${sorted.length - shown.length} more`));
     }
   }
-  runtime.log(theme.muted("Full report: clawdbot security audit"));
-  runtime.log(theme.muted("Deep probe: clawdbot security audit --deep"));
+  runtime.log(theme.muted(`Full report: ${formatCliCommand("openclaw security audit")}`));
+  runtime.log(theme.muted(`Deep probe: ${formatCliCommand("openclaw security audit --deep")}`));
 
   runtime.log("");
   runtime.log(theme.heading("Channels"));
@@ -298,8 +469,11 @@ export async function statusCommand(
     for (const issue of channelIssues) {
       const key = issue.channel;
       const list = map.get(key);
-      if (list) list.push(issue);
-      else map.set(key, [issue]);
+      if (list) {
+        list.push(issue);
+      } else {
+        map.set(key, [issue]);
+      }
     }
     return map;
   })();
@@ -353,7 +527,7 @@ export async function statusCommand(
           ? summary.sessions.recent.map((sess) => ({
               Key: shortenText(sess.key, 32),
               Kind: sess.kind,
-              Age: sess.updatedAt ? formatAge(sess.age) : "no activity",
+              Age: sess.updatedAt ? formatTimeAgo(sess.age) : "no activity",
               Model: sess.model ?? "unknown",
               Tokens: formatTokensCompact(sess),
             }))
@@ -396,19 +570,33 @@ export async function statusCommand(
       Detail: `${health.durationMs}ms`,
     });
 
-    for (const line of formatHealthChannelLines(health)) {
+    for (const line of formatHealthChannelLines(health, { accountMode: "all" })) {
       const colon = line.indexOf(":");
-      if (colon === -1) continue;
+      if (colon === -1) {
+        continue;
+      }
       const item = line.slice(0, colon).trim();
       const detail = line.slice(colon + 1).trim();
       const normalized = detail.toLowerCase();
       const status = (() => {
-        if (normalized.startsWith("ok")) return ok("OK");
-        if (normalized.startsWith("failed")) return warn("WARN");
-        if (normalized.startsWith("not configured")) return muted("OFF");
-        if (normalized.startsWith("configured")) return ok("OK");
-        if (normalized.startsWith("linked")) return ok("LINKED");
-        if (normalized.startsWith("not linked")) return warn("UNLINKED");
+        if (normalized.startsWith("ok")) {
+          return ok("OK");
+        }
+        if (normalized.startsWith("failed")) {
+          return warn("WARN");
+        }
+        if (normalized.startsWith("not configured")) {
+          return muted("OFF");
+        }
+        if (normalized.startsWith("configured")) {
+          return ok("OK");
+        }
+        if (normalized.startsWith("linked")) {
+          return ok("LINKED");
+        }
+        if (normalized.startsWith("not linked")) {
+          return warn("UNLINKED");
+        }
         return warn("WARN");
       })();
       rows.push({ Item: item, Status: status, Detail: detail });
@@ -436,15 +624,20 @@ export async function statusCommand(
   }
 
   runtime.log("");
-  runtime.log("FAQ: https://docs.clawd.bot/faq");
-  runtime.log("Troubleshooting: https://docs.clawd.bot/troubleshooting");
+  runtime.log("FAQ: https://docs.openclaw.ai/faq");
+  runtime.log("Troubleshooting: https://docs.openclaw.ai/troubleshooting");
   runtime.log("");
+  const updateHint = formatUpdateAvailableHint(update);
+  if (updateHint) {
+    runtime.log(theme.warn(updateHint));
+    runtime.log("");
+  }
   runtime.log("Next steps:");
-  runtime.log("  Need to share?      clawdbot status --all");
-  runtime.log("  Need to debug live? clawdbot logs --follow");
+  runtime.log(`  Need to share?      ${formatCliCommand("openclaw status --all")}`);
+  runtime.log(`  Need to debug live? ${formatCliCommand("openclaw logs --follow")}`);
   if (gatewayReachable) {
-    runtime.log("  Need to test channels? clawdbot status --deep");
+    runtime.log(`  Need to test channels? ${formatCliCommand("openclaw status --deep")}`);
   } else {
-    runtime.log("  Fix reachability first: clawdbot gateway status");
+    runtime.log(`  Fix reachability first: ${formatCliCommand("openclaw gateway probe")}`);
   }
 }

@@ -1,4 +1,5 @@
-import type { ClawdbotConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/config.js";
+import type { SkillsInstallPreferences } from "./skills/types.js";
 
 export {
   hasBinary,
@@ -14,7 +15,9 @@ export {
   applySkillEnvOverridesFromSnapshot,
 } from "./skills/env-overrides.js";
 export type {
-  ClawdbotSkillMetadata,
+  OpenClawSkillMetadata,
+  SkillEligibilityContext,
+  SkillCommandSpec,
   SkillEntry,
   SkillInstallSpec,
   SkillSnapshot,
@@ -23,20 +26,21 @@ export type {
 export {
   buildWorkspaceSkillSnapshot,
   buildWorkspaceSkillsPrompt,
+  buildWorkspaceSkillCommandSpecs,
   filterWorkspaceSkillEntries,
   loadWorkspaceSkillEntries,
   resolveSkillsPromptForRun,
   syncSkillsToWorkspace,
 } from "./skills/workspace.js";
 
-export function resolveSkillsInstallPreferences(config?: ClawdbotConfig) {
+export function resolveSkillsInstallPreferences(config?: OpenClawConfig): SkillsInstallPreferences {
   const raw = config?.skills?.install;
   const preferBrew = raw?.preferBrew ?? true;
   const managerRaw = typeof raw?.nodeManager === "string" ? raw.nodeManager.trim() : "";
   const manager = managerRaw.toLowerCase();
-  const nodeManager =
+  const nodeManager: SkillsInstallPreferences["nodeManager"] =
     manager === "pnpm" || manager === "yarn" || manager === "bun" || manager === "npm"
-      ? (manager as "npm" | "pnpm" | "yarn" | "bun")
+      ? manager
       : "npm";
   return { preferBrew, nodeManager };
 }

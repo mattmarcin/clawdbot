@@ -1,16 +1,22 @@
-import type { ClawdbotConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/config.js";
+import type { RuntimeEnv } from "../runtime.js";
 import { buildGatewayConnectionDetails, callGateway } from "../gateway/call.js";
 import { collectChannelStatusIssues } from "../infra/channels-status-issues.js";
-import type { RuntimeEnv } from "../runtime.js";
 import { note } from "../terminal/note.js";
-import { healthCommand } from "./health.js";
 import { formatHealthCheckFailure } from "./health-format.js";
+import { healthCommand } from "./health.js";
 
-export async function checkGatewayHealth(params: { runtime: RuntimeEnv; cfg: ClawdbotConfig }) {
+export async function checkGatewayHealth(params: {
+  runtime: RuntimeEnv;
+  cfg: OpenClawConfig;
+  timeoutMs?: number;
+}) {
   const gatewayDetails = buildGatewayConnectionDetails({ config: params.cfg });
+  const timeoutMs =
+    typeof params.timeoutMs === "number" && params.timeoutMs > 0 ? params.timeoutMs : 10_000;
   let healthOk = false;
   try {
-    await healthCommand({ json: false, timeoutMs: 10_000 }, params.runtime);
+    await healthCommand({ json: false, timeoutMs, config: params.cfg }, params.runtime);
     healthOk = true;
   } catch (err) {
     const message = String(err);
@@ -24,7 +30,7 @@ export async function checkGatewayHealth(params: { runtime: RuntimeEnv; cfg: Cla
 
   if (healthOk) {
     try {
-      const status = await callGateway<Record<string, unknown>>({
+      const status = await callGateway({
         method: "channels.status",
         params: { probe: true, timeoutMs: 5000 },
         timeoutMs: 6000,

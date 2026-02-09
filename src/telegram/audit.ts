@@ -8,6 +8,8 @@ export type TelegramGroupMembershipAuditEntry = {
   ok: boolean;
   status?: string | null;
   error?: string | null;
+  matchKey?: string;
+  matchSource?: "id";
 };
 
 export type TelegramGroupMembershipAudit = {
@@ -55,12 +57,22 @@ export function collectTelegramUnmentionedGroupIds(
   const groupIds: string[] = [];
   let unresolvedGroups = 0;
   for (const [key, value] of Object.entries(groups)) {
-    if (key === "*") continue;
-    if (!value || typeof value !== "object") continue;
-    if ((value as TelegramGroupConfig).enabled === false) continue;
-    if ((value as TelegramGroupConfig).requireMention !== false) continue;
+    if (key === "*") {
+      continue;
+    }
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    if (value.enabled === false) {
+      continue;
+    }
+    if (value.requireMention !== false) {
+      continue;
+    }
     const id = String(key).trim();
-    if (!id) continue;
+    if (!id) {
+      continue;
+    }
     if (/^-?\d+$/.test(id)) {
       groupIds.push(id);
     } else {
@@ -100,12 +112,19 @@ export async function auditTelegramGroupMembership(params: {
       const url = `${base}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${encodeURIComponent(String(params.botId))}`;
       const res = await fetchWithTimeout(url, params.timeoutMs, fetcher);
       const json = (await res.json()) as TelegramApiOk<{ status?: string }> | TelegramApiErr;
-      if (!res.ok || !isRecord(json) || json.ok !== true) {
+      if (!res.ok || !isRecord(json) || !json.ok) {
         const desc =
-          isRecord(json) && json.ok === false && typeof json.description === "string"
+          isRecord(json) && !json.ok && typeof json.description === "string"
             ? json.description
             : `getChatMember failed (${res.status})`;
-        groups.push({ chatId, ok: false, status: null, error: desc });
+        groups.push({
+          chatId,
+          ok: false,
+          status: null,
+          error: desc,
+          matchKey: chatId,
+          matchSource: "id",
+        });
         continue;
       }
       const status = isRecord((json as TelegramApiOk<unknown>).result)
@@ -117,6 +136,8 @@ export async function auditTelegramGroupMembership(params: {
         ok,
         status,
         error: ok ? null : "bot not in group",
+        matchKey: chatId,
+        matchSource: "id",
       });
     } catch (err) {
       groups.push({
@@ -124,6 +145,8 @@ export async function auditTelegramGroupMembership(params: {
         ok: false,
         status: null,
         error: err instanceof Error ? err.message : String(err),
+        matchKey: chatId,
+        matchSource: "id",
       });
     }
   }

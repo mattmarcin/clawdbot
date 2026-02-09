@@ -7,6 +7,7 @@ struct RootTabs: View {
     @State private var selectedTab: Int = 0
     @State private var voiceWakeToastText: String?
     @State private var toastDismissTask: Task<Void, Never>?
+    @State private var showGatewayActions: Bool = false
 
     var body: some View {
         TabView(selection: self.$selectedTab) {
@@ -24,10 +25,16 @@ struct RootTabs: View {
         }
         .overlay(alignment: .topLeading) {
             StatusPill(
-                bridge: self.bridgeStatus,
+                gateway: self.gatewayStatus,
                 voiceWakeEnabled: self.voiceWakeEnabled,
                 activity: self.statusActivity,
-                onTap: { self.selectedTab = 2 })
+                onTap: {
+                    if self.gatewayStatus == .connected {
+                        self.showGatewayActions = true
+                    } else {
+                        self.selectedTab = 2
+                    }
+                })
                 .padding(.leading, 10)
                 .safeAreaPadding(.top, 10)
         }
@@ -62,12 +69,27 @@ struct RootTabs: View {
             self.toastDismissTask?.cancel()
             self.toastDismissTask = nil
         }
+        .confirmationDialog(
+            "Gateway",
+            isPresented: self.$showGatewayActions,
+            titleVisibility: .visible)
+        {
+            Button("Disconnect", role: .destructive) {
+                self.appModel.disconnectGateway()
+            }
+            Button("Open Settings") {
+                self.selectedTab = 2
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Disconnect from the gateway?")
+        }
     }
 
-    private var bridgeStatus: StatusPill.BridgeState {
-        if self.appModel.bridgeServerName != nil { return .connected }
+    private var gatewayStatus: StatusPill.GatewayState {
+        if self.appModel.gatewayServerName != nil { return .connected }
 
-        let text = self.appModel.bridgeStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = self.appModel.gatewayStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.localizedCaseInsensitiveContains("connecting") ||
             text.localizedCaseInsensitiveContains("reconnecting")
         {
@@ -90,15 +112,15 @@ struct RootTabs: View {
                 tint: .orange)
         }
 
-        let bridgeStatus = self.appModel.bridgeStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let bridgeLower = bridgeStatus.lowercased()
-        if bridgeLower.contains("repair") {
+        let gatewayStatus = self.appModel.gatewayStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let gatewayLower = gatewayStatus.lowercased()
+        if gatewayLower.contains("repair") {
             return StatusPill.Activity(title: "Repairing…", systemImage: "wrench.and.screwdriver", tint: .orange)
         }
-        if bridgeLower.contains("approval") || bridgeLower.contains("pairing") {
+        if gatewayLower.contains("approval") || gatewayLower.contains("pairing") {
             return StatusPill.Activity(title: "Approval pending", systemImage: "person.crop.circle.badge.clock")
         }
-        // Avoid duplicating the primary bridge status ("Connecting…") in the activity slot.
+        // Avoid duplicating the primary gateway status ("Connecting…") in the activity slot.
 
         if self.appModel.screenRecordActive {
             return StatusPill.Activity(title: "Recording screen…", systemImage: "record.circle.fill", tint: .red)
@@ -133,6 +155,10 @@ struct RootTabs: View {
                 return StatusPill.Activity(title: "Mic permission", systemImage: "mic.slash", tint: .orange)
             }
             if voiceStatus == "Paused" {
+                // Talk mode intentionally pauses voice wake to release the mic. Don't spam the HUD for that case.
+                if self.appModel.talkMode.isEnabled {
+                    return nil
+                }
                 let suffix = self.appModel.isBackgrounded ? " (background)" : ""
                 return StatusPill.Activity(title: "Voice Wake paused\(suffix)", systemImage: "pause.circle.fill")
             }

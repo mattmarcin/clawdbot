@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
 import type { RuntimeEnv } from "../runtime.js";
+import { discordPlugin } from "../../extensions/discord/src/channel.js";
+import { imessagePlugin } from "../../extensions/imessage/src/channel.js";
+import { signalPlugin } from "../../extensions/signal/src/channel.js";
+import { slackPlugin } from "../../extensions/slack/src/channel.js";
+import { telegramPlugin } from "../../extensions/telegram/src/channel.js";
+import { whatsappPlugin } from "../../extensions/whatsapp/src/channel.js";
+import { setActivePluginRegistry } from "../plugins/runtime.js";
+import { createTestRegistry } from "../test-utils/channel-plugins.js";
 
 const configMocks = vi.hoisted(() => ({
   readConfigFileSnapshot: vi.fn(),
@@ -42,7 +49,7 @@ const runtime: RuntimeEnv = {
 };
 
 const baseSnapshot = {
-  path: "/tmp/clawdbot.json",
+  path: "/tmp/openclaw.json",
   exists: true,
   raw: "{}",
   parsed: {},
@@ -64,6 +71,16 @@ describe("channels command", () => {
       version: 1,
       profiles: {},
     });
+    setActivePluginRegistry(
+      createTestRegistry([
+        { pluginId: "discord", plugin: discordPlugin, source: "test" },
+        { pluginId: "slack", plugin: slackPlugin, source: "test" },
+        { pluginId: "telegram", plugin: telegramPlugin, source: "test" },
+        { pluginId: "whatsapp", plugin: whatsappPlugin, source: "test" },
+        { pluginId: "signal", plugin: signalPlugin, source: "test" },
+        { pluginId: "imessage", plugin: imessagePlugin, source: "test" },
+      ]),
+    );
   });
 
   it("adds a non-default telegram account", async () => {
@@ -226,7 +243,7 @@ describe("channels command", () => {
     authMocks.loadAuthProfileStore.mockReturnValue({
       version: 1,
       profiles: {
-        "anthropic:claude-cli": {
+        "anthropic:default": {
           type: "oauth",
           provider: "anthropic",
           access: "token",
@@ -234,7 +251,7 @@ describe("channels command", () => {
           expires: 0,
           created: 0,
         },
-        "openai-codex:codex-cli": {
+        "openai-codex:default": {
           type: "oauth",
           provider: "openai",
           access: "token",
@@ -250,8 +267,8 @@ describe("channels command", () => {
       auth?: Array<{ id: string }>;
     };
     const ids = payload.auth?.map((entry) => entry.id) ?? [];
-    expect(ids).toContain("anthropic:claude-cli");
-    expect(ids).toContain("openai-codex:codex-cli");
+    expect(ids).toContain("anthropic:default");
+    expect(ids).toContain("openai-codex:default");
   });
 
   it("stores default account names in accounts when multiple accounts exist", async () => {
@@ -352,7 +369,7 @@ describe("channels command", () => {
     });
     expect(lines.join("\n")).toMatch(/Warnings:/);
     expect(lines.join("\n")).toMatch(/Message Content Intent is disabled/i);
-    expect(lines.join("\n")).toMatch(/Run: clawdbot doctor/);
+    expect(lines.join("\n")).toMatch(/Run: (?:openclaw|openclaw)( --profile isolated)? doctor/);
   });
 
   it("surfaces Discord permission audit issues in channels status output", () => {
@@ -397,6 +414,22 @@ describe("channels command", () => {
     });
     expect(lines.join("\n")).toMatch(/Warnings:/);
     expect(lines.join("\n")).toMatch(/Telegram Bot API privacy mode/i);
+  });
+
+  it("includes Telegram bot username from probe data", () => {
+    const lines = formatGatewayChannelsStatusLines({
+      channelAccounts: {
+        telegram: [
+          {
+            accountId: "default",
+            enabled: true,
+            configured: true,
+            probe: { ok: true, bot: { username: "openclaw_bot" } },
+          },
+        ],
+      },
+    });
+    expect(lines.join("\n")).toMatch(/bot:@openclaw_bot/);
   });
 
   it("surfaces Telegram group membership audit issues in channels status output", () => {

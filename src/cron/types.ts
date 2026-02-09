@@ -1,7 +1,7 @@
 import type { ChannelId } from "../channels/plugins/types.js";
 
 export type CronSchedule =
-  | { kind: "at"; atMs: number }
+  | { kind: "at"; at: string }
   | { kind: "every"; everyMs: number; anchorMs?: number }
   | { kind: "cron"; expr: string; tz?: string };
 
@@ -9,6 +9,17 @@ export type CronSessionTarget = "main" | "isolated";
 export type CronWakeMode = "next-heartbeat" | "now";
 
 export type CronMessageChannel = ChannelId | "last";
+
+export type CronDeliveryMode = "none" | "announce";
+
+export type CronDelivery = {
+  mode: CronDeliveryMode;
+  channel?: CronMessageChannel;
+  to?: string;
+  bestEffort?: boolean;
+};
+
+export type CronDeliveryPatch = Partial<CronDelivery>;
 
 export type CronPayload =
   | { kind: "systemEvent"; text: string }
@@ -19,15 +30,27 @@ export type CronPayload =
       model?: string;
       thinking?: string;
       timeoutSeconds?: number;
+      allowUnsafeExternalContent?: boolean;
       deliver?: boolean;
       channel?: CronMessageChannel;
       to?: string;
       bestEffortDeliver?: boolean;
     };
 
-export type CronIsolation = {
-  postToMainPrefix?: string;
-};
+export type CronPayloadPatch =
+  | { kind: "systemEvent"; text?: string }
+  | {
+      kind: "agentTurn";
+      message?: string;
+      model?: string;
+      thinking?: string;
+      timeoutSeconds?: number;
+      allowUnsafeExternalContent?: boolean;
+      deliver?: boolean;
+      channel?: CronMessageChannel;
+      to?: string;
+      bestEffortDeliver?: boolean;
+    };
 
 export type CronJobState = {
   nextRunAtMs?: number;
@@ -36,6 +59,8 @@ export type CronJobState = {
   lastStatus?: "ok" | "error" | "skipped";
   lastError?: string;
   lastDurationMs?: number;
+  /** Number of consecutive execution errors (reset on success). Used for backoff. */
+  consecutiveErrors?: number;
 };
 
 export type CronJob = {
@@ -51,7 +76,7 @@ export type CronJob = {
   sessionTarget: CronSessionTarget;
   wakeMode: CronWakeMode;
   payload: CronPayload;
-  isolation?: CronIsolation;
+  delivery?: CronDelivery;
   state: CronJobState;
 };
 
@@ -64,6 +89,8 @@ export type CronJobCreate = Omit<CronJob, "id" | "createdAtMs" | "updatedAtMs" |
   state?: Partial<CronJobState>;
 };
 
-export type CronJobPatch = Partial<
-  Omit<CronJob, "id" | "createdAtMs" | "state"> & { state: CronJobState }
->;
+export type CronJobPatch = Partial<Omit<CronJob, "id" | "createdAtMs" | "state" | "payload">> & {
+  payload?: CronPayloadPatch;
+  delivery?: CronDeliveryPatch;
+  state?: Partial<CronJobState>;
+};

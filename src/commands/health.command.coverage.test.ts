@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
 import type { HealthSummary } from "./health.js";
+import { setActivePluginRegistry } from "../plugins/runtime.js";
+import { stripAnsi } from "../terminal/ansi.js";
+import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import { healthCommand } from "./health.js";
 
 const callGatewayMock = vi.fn();
@@ -25,6 +27,32 @@ describe("healthCommand (coverage)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "whatsapp",
+          source: "test",
+          plugin: {
+            id: "whatsapp",
+            meta: {
+              id: "whatsapp",
+              label: "WhatsApp",
+              selectionLabel: "WhatsApp",
+              docsPath: "/channels/whatsapp",
+              blurb: "WhatsApp test stub.",
+            },
+            capabilities: { chatTypes: ["direct", "group"] },
+            config: {
+              listAccountIds: () => ["default"],
+              resolveAccount: () => ({}),
+            },
+            status: {
+              logSelfId: () => logWebSelfIdMock(),
+            },
+          },
+        },
+      ]),
+    );
   });
 
   it("prints the rich text summary when linked and configured", async () => {
@@ -34,10 +62,12 @@ describe("healthCommand (coverage)", () => {
       durationMs: 5,
       channels: {
         whatsapp: {
+          accountId: "default",
           linked: true,
           authAgeMs: 5 * 60_000,
         },
         telegram: {
+          accountId: "default",
           configured: true,
           probe: {
             ok: true,
@@ -47,6 +77,7 @@ describe("healthCommand (coverage)", () => {
           },
         },
         discord: {
+          accountId: "default",
           configured: false,
         },
       },
@@ -57,6 +88,29 @@ describe("healthCommand (coverage)", () => {
         discord: "Discord",
       },
       heartbeatSeconds: 60,
+      defaultAgentId: "main",
+      agents: [
+        {
+          agentId: "main",
+          isDefault: true,
+          heartbeat: {
+            enabled: true,
+            every: "1m",
+            everyMs: 60_000,
+            prompt: "hi",
+            target: "last",
+            ackMaxChars: 160,
+          },
+          sessions: {
+            path: "/tmp/sessions.json",
+            count: 2,
+            recent: [
+              { key: "main", updatedAt: Date.now() - 60_000, age: 60_000 },
+              { key: "foo", updatedAt: null, age: null },
+            ],
+          },
+        },
+      ],
       sessions: {
         path: "/tmp/sessions.json",
         count: 2,
@@ -70,7 +124,9 @@ describe("healthCommand (coverage)", () => {
     await healthCommand({ json: false, timeoutMs: 1000 }, runtime as never);
 
     expect(runtime.exit).not.toHaveBeenCalled();
-    expect(runtime.log.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(/WhatsApp: linked/i);
+    expect(stripAnsi(runtime.log.mock.calls.map((c) => String(c[0])).join("\n"))).toMatch(
+      /WhatsApp: linked/i,
+    );
     expect(logWebSelfIdMock).toHaveBeenCalled();
   });
 });

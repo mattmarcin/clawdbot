@@ -1,6 +1,7 @@
-import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type { ChannelId } from "../../channels/plugins/types.js";
 import type { OutboundDeliveryResult } from "./deliver.js";
+import { getChannelPlugin } from "../../channels/plugins/index.js";
+import { getChatChannelMeta, normalizeChatChannelId } from "../../channels/registry.js";
 
 export type OutboundDeliveryJson = {
   channel: string;
@@ -10,6 +11,7 @@ export type OutboundDeliveryJson = {
   mediaUrl: string | null;
   chatId?: string;
   channelId?: string;
+  roomId?: string;
   conversationId?: string;
   timestamp?: number;
   toJid?: string;
@@ -20,14 +22,24 @@ type OutboundDeliveryMeta = {
   messageId?: string;
   chatId?: string;
   channelId?: string;
+  roomId?: string;
   conversationId?: string;
   timestamp?: number;
   toJid?: string;
   meta?: Record<string, unknown>;
 };
 
-const resolveChannelLabel = (channel: string) =>
-  getChannelPlugin(channel as ChannelId)?.meta.label ?? channel;
+const resolveChannelLabel = (channel: string) => {
+  const pluginLabel = getChannelPlugin(channel as ChannelId)?.meta.label;
+  if (pluginLabel) {
+    return pluginLabel;
+  }
+  const normalized = normalizeChatChannelId(channel);
+  if (normalized) {
+    return getChatChannelMeta(normalized).label;
+  }
+  return channel;
+};
 
 export function formatOutboundDeliverySummary(
   channel: string,
@@ -40,9 +52,18 @@ export function formatOutboundDeliverySummary(
   const label = resolveChannelLabel(result.channel);
   const base = `✅ Sent via ${label}. Message ID: ${result.messageId}`;
 
-  if ("chatId" in result) return `${base} (chat ${result.chatId})`;
-  if ("channelId" in result) return `${base} (channel ${result.channelId})`;
-  if ("conversationId" in result) return `${base} (conversation ${result.conversationId})`;
+  if ("chatId" in result) {
+    return `${base} (chat ${result.chatId})`;
+  }
+  if ("channelId" in result) {
+    return `${base} (channel ${result.channelId})`;
+  }
+  if ("roomId" in result) {
+    return `${base} (room ${result.roomId})`;
+  }
+  if ("conversationId" in result) {
+    return `${base} (conversation ${result.conversationId})`;
+  }
   return base;
 }
 
@@ -68,6 +89,9 @@ export function buildOutboundDeliveryJson(params: {
   }
   if (result && "channelId" in result && result.channelId !== undefined) {
     payload.channelId = result.channelId;
+  }
+  if (result && "roomId" in result && result.roomId !== undefined) {
+    payload.roomId = result.roomId;
   }
   if (result && "conversationId" in result && result.conversationId !== undefined) {
     payload.conversationId = result.conversationId;

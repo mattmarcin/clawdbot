@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-
-import type { BrowserProfileConfig, ClawdbotConfig } from "../config/config.js";
+import type { BrowserProfileConfig, OpenClawConfig } from "../config/config.js";
+import type { BrowserRouteContext, ProfileStatus } from "./server-context.js";
 import { loadConfig, writeConfigFile } from "../config/config.js";
 import { deriveDefaultBrowserCdpPortRange } from "../config/port-defaults.js";
-import { resolveClawdUserDataDir } from "./chrome.js";
+import { resolveOpenClawUserDataDir } from "./chrome.js";
 import { parseHttpUrl, resolveProfile } from "./config.js";
+import { DEFAULT_BROWSER_DEFAULT_PROFILE_NAME } from "./constants.js";
 import {
   allocateCdpPort,
   allocateColor,
@@ -13,14 +14,13 @@ import {
   getUsedPorts,
   isValidProfileName,
 } from "./profiles.js";
-import type { BrowserRouteContext, ProfileStatus } from "./server-context.js";
 import { movePathToTrash } from "./trash.js";
 
 export type CreateProfileParams = {
   name: string;
   color?: string;
   cdpUrl?: string;
-  driver?: "clawd" | "extension";
+  driver?: "openclaw" | "extension";
 };
 
 export type CreateProfileResult = {
@@ -92,7 +92,7 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
       };
     }
 
-    const nextConfig: ClawdbotConfig = {
+    const nextConfig: OpenClawConfig = {
       ...cfg,
       browser: {
         ...cfg.browser,
@@ -123,7 +123,9 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
 
   const deleteProfile = async (nameRaw: string): Promise<DeleteProfileResult> => {
     const name = nameRaw.trim();
-    if (!name) throw new Error("profile name is required");
+    if (!name) {
+      throw new Error("profile name is required");
+    }
     if (!isValidProfileName(name)) {
       throw new Error("invalid profile name");
     }
@@ -134,7 +136,7 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
       throw new Error(`profile "${name}" not found`);
     }
 
-    const defaultProfile = cfg.browser?.defaultProfile ?? "clawd";
+    const defaultProfile = cfg.browser?.defaultProfile ?? DEFAULT_BROWSER_DEFAULT_PROFILE_NAME;
     if (name === defaultProfile) {
       throw new Error(
         `cannot delete the default profile "${name}"; change browser.defaultProfile first`,
@@ -152,7 +154,7 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
         // ignore
       }
 
-      const userDataDir = resolveClawdUserDataDir(name);
+      const userDataDir = resolveOpenClawUserDataDir(name);
       const profileDir = path.dirname(userDataDir);
       if (fs.existsSync(profileDir)) {
         await movePathToTrash(profileDir);
@@ -161,7 +163,7 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
     }
 
     const { [name]: _removed, ...remainingProfiles } = profiles;
-    const nextConfig: ClawdbotConfig = {
+    const nextConfig: OpenClawConfig = {
       ...cfg,
       browser: {
         ...cfg.browser,

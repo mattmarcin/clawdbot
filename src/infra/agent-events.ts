@@ -1,3 +1,5 @@
+import type { VerboseLevel } from "../auto-reply/thinking.js";
+
 export type AgentEventStream = "lifecycle" | "tool" | "assistant" | "error" | (string & {});
 
 export type AgentEventPayload = {
@@ -11,7 +13,8 @@ export type AgentEventPayload = {
 
 export type AgentRunContext = {
   sessionKey?: string;
-  verboseLevel?: "off" | "on";
+  verboseLevel?: VerboseLevel;
+  isHeartbeat?: boolean;
 };
 
 // Keep per-run counters so streams stay strictly monotonic per runId.
@@ -20,7 +23,9 @@ const listeners = new Set<(evt: AgentEventPayload) => void>();
 const runContextById = new Map<string, AgentRunContext>();
 
 export function registerAgentRunContext(runId: string, context: AgentRunContext) {
-  if (!runId) return;
+  if (!runId) {
+    return;
+  }
   const existing = runContextById.get(runId);
   if (!existing) {
     runContextById.set(runId, { ...context });
@@ -31,6 +36,9 @@ export function registerAgentRunContext(runId: string, context: AgentRunContext)
   }
   if (context.verboseLevel && existing.verboseLevel !== context.verboseLevel) {
     existing.verboseLevel = context.verboseLevel;
+  }
+  if (context.isHeartbeat !== undefined && existing.isHeartbeat !== context.isHeartbeat) {
+    existing.isHeartbeat = context.isHeartbeat;
   }
 }
 
@@ -49,8 +57,14 @@ export function resetAgentRunContextForTest() {
 export function emitAgentEvent(event: Omit<AgentEventPayload, "seq" | "ts">) {
   const nextSeq = (seqByRun.get(event.runId) ?? 0) + 1;
   seqByRun.set(event.runId, nextSeq);
+  const context = runContextById.get(event.runId);
+  const sessionKey =
+    typeof event.sessionKey === "string" && event.sessionKey.trim()
+      ? event.sessionKey
+      : context?.sessionKey;
   const enriched: AgentEventPayload = {
     ...event,
+    sessionKey,
     seq: nextSeq,
     ts: Date.now(),
   };

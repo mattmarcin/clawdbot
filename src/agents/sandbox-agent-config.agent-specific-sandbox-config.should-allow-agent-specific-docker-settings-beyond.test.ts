@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Readable } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClawdbotConfig } from "../config/config.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/config.js";
 
 // We need to test the internal defaultSandboxConfig function, but it's not exported.
 // Instead, we test the behavior through resolveSandboxContext which uses it.
@@ -45,15 +48,41 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
+vi.mock("../skills.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../skills.js")>();
+  return {
+    ...actual,
+    syncSkillsToWorkspace: vi.fn(async () => undefined),
+  };
+});
 describe("Agent-specific sandbox config", () => {
-  beforeEach(() => {
+  let previousStateDir: string | undefined;
+  let tempStateDir: string | undefined;
+
+  beforeEach(async () => {
     spawnCalls.length = 0;
+    previousStateDir = process.env.MOLTBOT_STATE_DIR;
+    tempStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "moltbot-test-state-"));
+    process.env.MOLTBOT_STATE_DIR = tempStateDir;
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    if (tempStateDir) {
+      await fs.rm(tempStateDir, { recursive: true, force: true });
+    }
+    if (previousStateDir === undefined) {
+      delete process.env.MOLTBOT_STATE_DIR;
+    } else {
+      process.env.MOLTBOT_STATE_DIR = previousStateDir;
+    }
+    tempStateDir = undefined;
   });
 
   it("should allow agent-specific docker settings beyond setupCommand", async () => {
     const { resolveSandboxContext } = await import("./sandbox.js");
 
-    const cfg: ClawdbotConfig = {
+    const cfg: OpenClawConfig = {
       agents: {
         defaults: {
           sandbox: {
@@ -68,7 +97,7 @@ describe("Agent-specific sandbox config", () => {
         list: [
           {
             id: "work",
-            workspace: "~/clawd-work",
+            workspace: "~/openclaw-work",
             sandbox: {
               mode: "all",
               scope: "agent",
@@ -95,7 +124,7 @@ describe("Agent-specific sandbox config", () => {
   it("should override with agent-specific sandbox mode 'off'", async () => {
     const { resolveSandboxContext } = await import("./sandbox.js");
 
-    const cfg: ClawdbotConfig = {
+    const cfg: OpenClawConfig = {
       agents: {
         defaults: {
           sandbox: {
@@ -106,7 +135,7 @@ describe("Agent-specific sandbox config", () => {
         list: [
           {
             id: "main",
-            workspace: "~/clawd",
+            workspace: "~/openclaw",
             sandbox: {
               mode: "off", // Agent override
             },
@@ -127,7 +156,7 @@ describe("Agent-specific sandbox config", () => {
   it("should use agent-specific sandbox mode 'all'", async () => {
     const { resolveSandboxContext } = await import("./sandbox.js");
 
-    const cfg: ClawdbotConfig = {
+    const cfg: OpenClawConfig = {
       agents: {
         defaults: {
           sandbox: {
@@ -137,7 +166,7 @@ describe("Agent-specific sandbox config", () => {
         list: [
           {
             id: "family",
-            workspace: "~/clawd-family",
+            workspace: "~/openclaw-family",
             sandbox: {
               mode: "all", // Agent override
               scope: "agent",
@@ -159,7 +188,7 @@ describe("Agent-specific sandbox config", () => {
   it("should use agent-specific scope", async () => {
     const { resolveSandboxContext } = await import("./sandbox.js");
 
-    const cfg: ClawdbotConfig = {
+    const cfg: OpenClawConfig = {
       agents: {
         defaults: {
           sandbox: {
@@ -170,7 +199,7 @@ describe("Agent-specific sandbox config", () => {
         list: [
           {
             id: "work",
-            workspace: "~/clawd-work",
+            workspace: "~/openclaw-work",
             sandbox: {
               mode: "all",
               scope: "agent", // Agent override

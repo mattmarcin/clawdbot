@@ -24,6 +24,8 @@ export type WebInboundMessage = {
   replyToId?: string;
   replyToBody?: string;
   replyToSender?: string;
+  replyToSenderJid?: string;
+  replyToSenderE164?: string;
   groupSubject?: string;
   groupParticipants?: string[];
   mentionedJids?: string[];
@@ -35,6 +37,7 @@ export type WebInboundMessage = {
   sendMedia: (payload: AnyMessageContent) => Promise<void>;
   mediaPath?: string;
   mediaType?: string;
+  mediaFileName?: string;
   mediaUrl?: string;
   wasMentioned?: boolean;
 };

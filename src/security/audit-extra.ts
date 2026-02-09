@@ -1,23 +1,34 @@
+import JSON5 from "json5";
 import fs from "node:fs/promises";
 import path from "node:path";
-
-import JSON5 from "json5";
-
-import type { ClawdbotConfig, ConfigFileSnapshot } from "../config/config.js";
+import type { SandboxToolPolicy } from "../agents/sandbox/types.js";
+import type { OpenClawConfig, ConfigFileSnapshot } from "../config/config.js";
+import type { AgentToolsConfig } from "../config/types.tools.js";
+import type { ExecFn } from "./windows-acl.js";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { isToolAllowedByPolicies } from "../agents/pi-tools.policy.js";
+import {
+  resolveSandboxConfigForAgent,
+  resolveSandboxToolPolicyForAgent,
+} from "../agents/sandbox.js";
+import { loadWorkspaceSkillEntries } from "../agents/skills.js";
+import { resolveToolProfilePolicy } from "../agents/tool-policy.js";
+import { resolveBrowserConfig } from "../browser/config.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import { MANIFEST_KEY } from "../compat/legacy-names.js";
+import { resolveNativeSkillsEnabled } from "../config/commands.js";
 import { createConfigIO } from "../config/config.js";
-import { resolveOAuthDir } from "../config/paths.js";
-import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { INCLUDE_KEY, MAX_INCLUDE_DEPTH } from "../config/includes.js";
+import { resolveOAuthDir } from "../config/paths.js";
+import { resolveGatewayAuth } from "../gateway/auth.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import {
-  formatOctal,
-  isGroupReadable,
-  isGroupWritable,
-  isWorldReadable,
-  isWorldWritable,
-  modeBits,
+  formatPermissionDetail,
+  formatPermissionRemediation,
+  inspectPathPermissions,
   safeStat,
 } from "./audit-fs.js";
+import { scanDirectoryWithSummary, type SkillScanFinding } from "./skill-scanner.js";
 
 export type SecurityAuditFinding = {
   checkId: string;
@@ -27,41 +38,59 @@ export type SecurityAuditFinding = {
   remediation?: string;
 };
 
+const SMALL_MODEL_PARAM_B_MAX = 300;
+
 function expandTilde(p: string, env: NodeJS.ProcessEnv): string | null {
-  if (!p.startsWith("~")) return p;
+  if (!p.startsWith("~")) {
+    return p;
+  }
   const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME.trim() : null;
-  if (!home) return null;
-  if (p === "~") return home;
-  if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(home, p.slice(2));
+  if (!home) {
+    return null;
+  }
+  if (p === "~") {
+    return home;
+  }
+  if (p.startsWith("~/") || p.startsWith("~\\")) {
+    return path.join(home, p.slice(2));
+  }
   return null;
 }
 
-function summarizeGroupPolicy(cfg: ClawdbotConfig): {
+function summarizeGroupPolicy(cfg: OpenClawConfig): {
   open: number;
   allowlist: number;
   other: number;
 } {
   const channels = cfg.channels as Record<string, unknown> | undefined;
-  if (!channels || typeof channels !== "object") return { open: 0, allowlist: 0, other: 0 };
+  if (!channels || typeof channels !== "object") {
+    return { open: 0, allowlist: 0, other: 0 };
+  }
   let open = 0;
   let allowlist = 0;
   let other = 0;
   for (const value of Object.values(channels)) {
-    if (!value || typeof value !== "object") continue;
+    if (!value || typeof value !== "object") {
+      continue;
+    }
     const section = value as Record<string, unknown>;
     const policy = section.groupPolicy;
-    if (policy === "open") open += 1;
-    else if (policy === "allowlist") allowlist += 1;
-    else other += 1;
+    if (policy === "open") {
+      open += 1;
+    } else if (policy === "allowlist") {
+      allowlist += 1;
+    } else {
+      other += 1;
+    }
   }
   return { open, allowlist, other };
 }
 
-export function collectAttackSurfaceSummaryFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+export function collectAttackSurfaceSummaryFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const group = summarizeGroupPolicy(cfg);
   const elevated = cfg.tools?.elevated?.enabled !== false;
   const hooksEnabled = cfg.hooks?.enabled === true;
-  const browserEnabled = Boolean(cfg.browser?.enabled ?? cfg.browser?.controlUrl);
+  const browserEnabled = cfg.browser?.enabled ?? true;
 
   const detail =
     `groups: open=${group.open}, allowlist=${group.allowlist}` +
@@ -104,7 +133,7 @@ export function collectSyncedFolderFindings(params: {
       severity: "warn",
       title: "State/config path looks like a synced folder",
       detail: `stateDir=${params.stateDir}, configPath=${params.configPath}. Synced folders (iCloud/Dropbox/OneDrive/Google Drive) can leak tokens and transcripts onto other devices.`,
-      remediation: `Keep CLAWDBOT_STATE_DIR on a local-only volume and re-run "clawdbot security audit --fix".`,
+      remediation: `Keep OPENCLAW_STATE_DIR on a local-only volume and re-run "${formatCliCommand("openclaw security audit --fix")}".`,
     });
   }
   return findings;
@@ -115,7 +144,7 @@ function looksLikeEnvRef(value: string): boolean {
   return v.startsWith("${") && v.endsWith("}");
 }
 
-export function collectSecretsInConfigFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+export function collectSecretsInConfigFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const password =
     typeof cfg.gateway?.auth?.password === "string" ? cfg.gateway.auth.password.trim() : "";
@@ -127,21 +156,7 @@ export function collectSecretsInConfigFindings(cfg: ClawdbotConfig): SecurityAud
       detail:
         "gateway.auth.password is set in the config file; prefer environment variables for secrets when possible.",
       remediation:
-        "Prefer CLAWDBOT_GATEWAY_PASSWORD (env) and remove gateway.auth.password from disk.",
-    });
-  }
-
-  const browserToken =
-    typeof cfg.browser?.controlToken === "string" ? cfg.browser.controlToken.trim() : "";
-  if (browserToken && !looksLikeEnvRef(browserToken)) {
-    findings.push({
-      checkId: "config.secrets.browser_control_token_in_config",
-      severity: "warn",
-      title: "Browser control token is stored in config",
-      detail:
-        "browser.controlToken is set in the config file; prefer environment variables for secrets when possible.",
-      remediation:
-        "Prefer CLAWDBOT_BROWSER_CONTROL_TOKEN (env) and remove browser.controlToken from disk.",
+        "Prefer OPENCLAW_GATEWAY_PASSWORD (env) and remove gateway.auth.password from disk.",
     });
   }
 
@@ -159,9 +174,11 @@ export function collectSecretsInConfigFindings(cfg: ClawdbotConfig): SecurityAud
   return findings;
 }
 
-export function collectHooksHardeningFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+export function collectHooksHardeningFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
-  if (cfg.hooks?.enabled !== true) return findings;
+  if (cfg.hooks?.enabled !== true) {
+    return findings;
+  }
 
   const token = typeof cfg.hooks?.token === "string" ? cfg.hooks.token.trim() : "";
   if (token && token.length < 24) {
@@ -173,9 +190,15 @@ export function collectHooksHardeningFindings(cfg: ClawdbotConfig): SecurityAudi
     });
   }
 
+  const gatewayAuth = resolveGatewayAuth({
+    authConfig: cfg.gateway?.auth,
+    tailscaleMode: cfg.gateway?.tailscale?.mode ?? "off",
+  });
   const gatewayToken =
-    typeof cfg.gateway?.auth?.token === "string" && cfg.gateway.auth.token.trim()
-      ? cfg.gateway.auth.token.trim()
+    gatewayAuth.mode === "token" &&
+    typeof gatewayAuth.token === "string" &&
+    gatewayAuth.token.trim()
+      ? gatewayAuth.token.trim()
       : null;
   if (token && gatewayToken && token === gatewayToken) {
     findings.push({
@@ -184,21 +207,6 @@ export function collectHooksHardeningFindings(cfg: ClawdbotConfig): SecurityAudi
       title: "Hooks token reuses the Gateway token",
       detail:
         "hooks.token matches gateway.auth token; compromise of hooks expands blast radius to the Gateway API.",
-      remediation: "Use a separate hooks.token dedicated to hook ingress.",
-    });
-  }
-
-  const browserToken =
-    typeof cfg.browser?.controlToken === "string" && cfg.browser.controlToken.trim()
-      ? cfg.browser.controlToken.trim()
-      : process.env.CLAWDBOT_BROWSER_CONTROL_TOKEN?.trim() || null;
-  if (token && browserToken && token === browserToken) {
-    findings.push({
-      checkId: "hooks.token_reuse_browser_token",
-      severity: "warn",
-      title: "Hooks token reuses the browser control token",
-      detail:
-        "hooks.token matches browser control token; compromise of hooks may enable browser control endpoints.",
       remediation: "Use a separate hooks.token dedicated to hook ingress.",
     });
   }
@@ -220,24 +228,32 @@ export function collectHooksHardeningFindings(cfg: ClawdbotConfig): SecurityAudi
 type ModelRef = { id: string; source: string };
 
 function addModel(models: ModelRef[], raw: unknown, source: string) {
-  if (typeof raw !== "string") return;
+  if (typeof raw !== "string") {
+    return;
+  }
   const id = raw.trim();
-  if (!id) return;
+  if (!id) {
+    return;
+  }
   models.push({ id, source });
 }
 
-function collectModels(cfg: ClawdbotConfig): ModelRef[] {
+function collectModels(cfg: OpenClawConfig): ModelRef[] {
   const out: ModelRef[] = [];
   addModel(out, cfg.agents?.defaults?.model?.primary, "agents.defaults.model.primary");
-  for (const f of cfg.agents?.defaults?.model?.fallbacks ?? [])
+  for (const f of cfg.agents?.defaults?.model?.fallbacks ?? []) {
     addModel(out, f, "agents.defaults.model.fallbacks");
+  }
   addModel(out, cfg.agents?.defaults?.imageModel?.primary, "agents.defaults.imageModel.primary");
-  for (const f of cfg.agents?.defaults?.imageModel?.fallbacks ?? [])
+  for (const f of cfg.agents?.defaults?.imageModel?.fallbacks ?? []) {
     addModel(out, f, "agents.defaults.imageModel.fallbacks");
+  }
 
   const list = Array.isArray(cfg.agents?.list) ? cfg.agents?.list : [];
   for (const agent of list ?? []) {
-    if (!agent || typeof agent !== "object") continue;
+    if (!agent || typeof agent !== "object") {
+      continue;
+    }
     const id =
       typeof (agent as { id?: unknown }).id === "string" ? (agent as { id: string }).id : "";
     const model = (agent as { model?: unknown }).model;
@@ -247,7 +263,9 @@ function collectModels(cfg: ClawdbotConfig): ModelRef[] {
       addModel(out, (model as { primary?: unknown }).primary, `agents.list.${id}.model.primary`);
       const fallbacks = (model as { fallbacks?: unknown }).fallbacks;
       if (Array.isArray(fallbacks)) {
-        for (const f of fallbacks) addModel(out, f, `agents.list.${id}.model.fallbacks`);
+        for (const f of fallbacks) {
+          addModel(out, f, `agents.list.${id}.model.fallbacks`);
+        }
       }
     }
   }
@@ -260,10 +278,85 @@ const LEGACY_MODEL_PATTERNS: Array<{ id: string; re: RegExp; label: string }> = 
   { id: "openai.gpt4_legacy", re: /\bgpt-4-(0314|0613)\b/i, label: "Legacy GPT-4 snapshots" },
 ];
 
-export function collectModelHygieneFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+const WEAK_TIER_MODEL_PATTERNS: Array<{ id: string; re: RegExp; label: string }> = [
+  { id: "anthropic.haiku", re: /\bhaiku\b/i, label: "Haiku tier (smaller model)" },
+];
+
+function inferParamBFromIdOrName(text: string): number | null {
+  const raw = text.toLowerCase();
+  const matches = raw.matchAll(/(?:^|[^a-z0-9])[a-z]?(\d+(?:\.\d+)?)b(?:[^a-z0-9]|$)/g);
+  let best: number | null = null;
+  for (const match of matches) {
+    const numRaw = match[1];
+    if (!numRaw) {
+      continue;
+    }
+    const value = Number(numRaw);
+    if (!Number.isFinite(value) || value <= 0) {
+      continue;
+    }
+    if (best === null || value > best) {
+      best = value;
+    }
+  }
+  return best;
+}
+
+function isGptModel(id: string): boolean {
+  return /\bgpt-/i.test(id);
+}
+
+function isGpt5OrHigher(id: string): boolean {
+  return /\bgpt-5(?:\b|[.-])/i.test(id);
+}
+
+function isClaudeModel(id: string): boolean {
+  return /\bclaude-/i.test(id);
+}
+
+function isClaude45OrHigher(id: string): boolean {
+  // Match claude-*-4-5+, claude-*-45+, claude-*4.5+, or future 5.x+ majors.
+  // Examples that should match:
+  //   claude-opus-4-5, claude-opus-4-6, claude-opus-45, claude-4.6, claude-sonnet-5
+  return /\bclaude-[^\s/]*?(?:-4-?(?:[5-9]|[1-9]\d)\b|4\.(?:[5-9]|[1-9]\d)\b|-[5-9](?:\b|[.-]))/i.test(
+    id,
+  );
+}
+
+export function collectModelHygieneFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const models = collectModels(cfg);
-  if (models.length === 0) return findings;
+  if (models.length === 0) {
+    return findings;
+  }
+
+  const weakMatches = new Map<string, { model: string; source: string; reasons: string[] }>();
+  const addWeakMatch = (model: string, source: string, reason: string) => {
+    const key = `${model}@@${source}`;
+    const existing = weakMatches.get(key);
+    if (!existing) {
+      weakMatches.set(key, { model, source, reasons: [reason] });
+      return;
+    }
+    if (!existing.reasons.includes(reason)) {
+      existing.reasons.push(reason);
+    }
+  };
+
+  for (const entry of models) {
+    for (const pat of WEAK_TIER_MODEL_PATTERNS) {
+      if (pat.re.test(entry.id)) {
+        addWeakMatch(entry.id, entry.source, pat.label);
+        break;
+      }
+    }
+    if (isGptModel(entry.id) && !isGpt5OrHigher(entry.id)) {
+      addWeakMatch(entry.id, entry.source, "Below GPT-5 family");
+    }
+    if (isClaudeModel(entry.id) && !isClaude45OrHigher(entry.id)) {
+      addWeakMatch(entry.id, entry.source, "Below Claude 4.5");
+    }
+  }
 
   const matches: Array<{ model: string; source: string; reason: string }> = [];
   for (const entry of models) {
@@ -293,33 +386,302 @@ export function collectModelHygieneFindings(cfg: ClawdbotConfig): SecurityAuditF
     });
   }
 
+  if (weakMatches.size > 0) {
+    const lines = Array.from(weakMatches.values())
+      .slice(0, 12)
+      .map((m) => `- ${m.model} (${m.reasons.join("; ")}) @ ${m.source}`)
+      .join("\n");
+    const more = weakMatches.size > 12 ? `\n…${weakMatches.size - 12} more` : "";
+    findings.push({
+      checkId: "models.weak_tier",
+      severity: "warn",
+      title: "Some configured models are below recommended tiers",
+      detail:
+        "Smaller/older models are generally more susceptible to prompt injection and tool misuse.\n" +
+        lines +
+        more,
+      remediation:
+        "Use the latest, top-tier model for any bot with tools or untrusted inboxes. Avoid Haiku tiers; prefer GPT-5+ and Claude 4.5+.",
+    });
+  }
+
+  return findings;
+}
+
+function extractAgentIdFromSource(source: string): string | null {
+  const match = source.match(/^agents\.list\.([^.]*)\./);
+  return match?.[1] ?? null;
+}
+
+function pickToolPolicy(config?: { allow?: string[]; deny?: string[] }): SandboxToolPolicy | null {
+  if (!config) {
+    return null;
+  }
+  const allow = Array.isArray(config.allow) ? config.allow : undefined;
+  const deny = Array.isArray(config.deny) ? config.deny : undefined;
+  if (!allow && !deny) {
+    return null;
+  }
+  return { allow, deny };
+}
+
+function resolveToolPolicies(params: {
+  cfg: OpenClawConfig;
+  agentTools?: AgentToolsConfig;
+  sandboxMode?: "off" | "non-main" | "all";
+  agentId?: string | null;
+}): SandboxToolPolicy[] {
+  const policies: SandboxToolPolicy[] = [];
+  const profile = params.agentTools?.profile ?? params.cfg.tools?.profile;
+  const profilePolicy = resolveToolProfilePolicy(profile);
+  if (profilePolicy) {
+    policies.push(profilePolicy);
+  }
+
+  const globalPolicy = pickToolPolicy(params.cfg.tools ?? undefined);
+  if (globalPolicy) {
+    policies.push(globalPolicy);
+  }
+
+  const agentPolicy = pickToolPolicy(params.agentTools);
+  if (agentPolicy) {
+    policies.push(agentPolicy);
+  }
+
+  if (params.sandboxMode === "all") {
+    const sandboxPolicy = resolveSandboxToolPolicyForAgent(params.cfg, params.agentId ?? undefined);
+    policies.push(sandboxPolicy);
+  }
+
+  return policies;
+}
+
+function hasWebSearchKey(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+  const search = cfg.tools?.web?.search;
+  return Boolean(
+    search?.apiKey ||
+    search?.perplexity?.apiKey ||
+    env.BRAVE_API_KEY ||
+    env.PERPLEXITY_API_KEY ||
+    env.OPENROUTER_API_KEY,
+  );
+}
+
+function isWebSearchEnabled(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+  const enabled = cfg.tools?.web?.search?.enabled;
+  if (enabled === false) {
+    return false;
+  }
+  if (enabled === true) {
+    return true;
+  }
+  return hasWebSearchKey(cfg, env);
+}
+
+function isWebFetchEnabled(cfg: OpenClawConfig): boolean {
+  const enabled = cfg.tools?.web?.fetch?.enabled;
+  if (enabled === false) {
+    return false;
+  }
+  return true;
+}
+
+function isBrowserEnabled(cfg: OpenClawConfig): boolean {
+  try {
+    return resolveBrowserConfig(cfg.browser, cfg).enabled;
+  } catch {
+    return true;
+  }
+}
+
+export function collectSmallModelRiskFindings(params: {
+  cfg: OpenClawConfig;
+  env: NodeJS.ProcessEnv;
+}): SecurityAuditFinding[] {
+  const findings: SecurityAuditFinding[] = [];
+  const models = collectModels(params.cfg).filter((entry) => !entry.source.includes("imageModel"));
+  if (models.length === 0) {
+    return findings;
+  }
+
+  const smallModels = models
+    .map((entry) => {
+      const paramB = inferParamBFromIdOrName(entry.id);
+      if (!paramB || paramB > SMALL_MODEL_PARAM_B_MAX) {
+        return null;
+      }
+      return { ...entry, paramB };
+    })
+    .filter((entry): entry is { id: string; source: string; paramB: number } => Boolean(entry));
+
+  if (smallModels.length === 0) {
+    return findings;
+  }
+
+  let hasUnsafe = false;
+  const modelLines: string[] = [];
+  const exposureSet = new Set<string>();
+  for (const entry of smallModels) {
+    const agentId = extractAgentIdFromSource(entry.source);
+    const sandboxMode = resolveSandboxConfigForAgent(params.cfg, agentId ?? undefined).mode;
+    const agentTools =
+      agentId && params.cfg.agents?.list
+        ? params.cfg.agents.list.find((agent) => agent?.id === agentId)?.tools
+        : undefined;
+    const policies = resolveToolPolicies({
+      cfg: params.cfg,
+      agentTools,
+      sandboxMode,
+      agentId,
+    });
+    const exposed: string[] = [];
+    if (isWebSearchEnabled(params.cfg, params.env)) {
+      if (isToolAllowedByPolicies("web_search", policies)) {
+        exposed.push("web_search");
+      }
+    }
+    if (isWebFetchEnabled(params.cfg)) {
+      if (isToolAllowedByPolicies("web_fetch", policies)) {
+        exposed.push("web_fetch");
+      }
+    }
+    if (isBrowserEnabled(params.cfg)) {
+      if (isToolAllowedByPolicies("browser", policies)) {
+        exposed.push("browser");
+      }
+    }
+    for (const tool of exposed) {
+      exposureSet.add(tool);
+    }
+    const sandboxLabel = sandboxMode === "all" ? "sandbox=all" : `sandbox=${sandboxMode}`;
+    const exposureLabel = exposed.length > 0 ? ` web=[${exposed.join(", ")}]` : " web=[off]";
+    const safe = sandboxMode === "all" && exposed.length === 0;
+    if (!safe) {
+      hasUnsafe = true;
+    }
+    const statusLabel = safe ? "ok" : "unsafe";
+    modelLines.push(
+      `- ${entry.id} (${entry.paramB}B) @ ${entry.source} (${statusLabel}; ${sandboxLabel};${exposureLabel})`,
+    );
+  }
+
+  const exposureList = Array.from(exposureSet);
+  const exposureDetail =
+    exposureList.length > 0
+      ? `Uncontrolled input tools allowed: ${exposureList.join(", ")}.`
+      : "No web/browser tools detected for these models.";
+
+  findings.push({
+    checkId: "models.small_params",
+    severity: hasUnsafe ? "critical" : "info",
+    title: "Small models require sandboxing and web tools disabled",
+    detail:
+      `Small models (<=${SMALL_MODEL_PARAM_B_MAX}B params) detected:\n` +
+      modelLines.join("\n") +
+      `\n` +
+      exposureDetail +
+      `\n` +
+      "Small models are not recommended for untrusted inputs.",
+    remediation:
+      'If you must use small models, enable sandboxing for all sessions (agents.defaults.sandbox.mode="all") and disable web_search/web_fetch/browser (tools.deny=["group:web","browser"]).',
+  });
+
   return findings;
 }
 
 export async function collectPluginsTrustFindings(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   stateDir: string;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
   const extensionsDir = path.join(params.stateDir, "extensions");
   const st = await safeStat(extensionsDir);
-  if (!st.ok || !st.isDir) return findings;
+  if (!st.ok || !st.isDir) {
+    return findings;
+  }
 
   const entries = await fs.readdir(extensionsDir, { withFileTypes: true }).catch(() => []);
   const pluginDirs = entries
     .filter((e) => e.isDirectory())
     .map((e) => e.name)
     .filter(Boolean);
-  if (pluginDirs.length === 0) return findings;
+  if (pluginDirs.length === 0) {
+    return findings;
+  }
 
   const allow = params.cfg.plugins?.allow;
   const allowConfigured = Array.isArray(allow) && allow.length > 0;
   if (!allowConfigured) {
+    const hasString = (value: unknown) => typeof value === "string" && value.trim().length > 0;
+    const hasAccountStringKey = (account: unknown, key: string) =>
+      Boolean(
+        account &&
+        typeof account === "object" &&
+        hasString((account as Record<string, unknown>)[key]),
+      );
+
+    const discordConfigured =
+      hasString(params.cfg.channels?.discord?.token) ||
+      Boolean(
+        params.cfg.channels?.discord?.accounts &&
+        Object.values(params.cfg.channels.discord.accounts).some((a) =>
+          hasAccountStringKey(a, "token"),
+        ),
+      ) ||
+      hasString(process.env.DISCORD_BOT_TOKEN);
+
+    const telegramConfigured =
+      hasString(params.cfg.channels?.telegram?.botToken) ||
+      hasString(params.cfg.channels?.telegram?.tokenFile) ||
+      Boolean(
+        params.cfg.channels?.telegram?.accounts &&
+        Object.values(params.cfg.channels.telegram.accounts).some(
+          (a) => hasAccountStringKey(a, "botToken") || hasAccountStringKey(a, "tokenFile"),
+        ),
+      ) ||
+      hasString(process.env.TELEGRAM_BOT_TOKEN);
+
+    const slackConfigured =
+      hasString(params.cfg.channels?.slack?.botToken) ||
+      hasString(params.cfg.channels?.slack?.appToken) ||
+      Boolean(
+        params.cfg.channels?.slack?.accounts &&
+        Object.values(params.cfg.channels.slack.accounts).some(
+          (a) => hasAccountStringKey(a, "botToken") || hasAccountStringKey(a, "appToken"),
+        ),
+      ) ||
+      hasString(process.env.SLACK_BOT_TOKEN) ||
+      hasString(process.env.SLACK_APP_TOKEN);
+
+    const skillCommandsLikelyExposed =
+      (discordConfigured &&
+        resolveNativeSkillsEnabled({
+          providerId: "discord",
+          providerSetting: params.cfg.channels?.discord?.commands?.nativeSkills,
+          globalSetting: params.cfg.commands?.nativeSkills,
+        })) ||
+      (telegramConfigured &&
+        resolveNativeSkillsEnabled({
+          providerId: "telegram",
+          providerSetting: params.cfg.channels?.telegram?.commands?.nativeSkills,
+          globalSetting: params.cfg.commands?.nativeSkills,
+        })) ||
+      (slackConfigured &&
+        resolveNativeSkillsEnabled({
+          providerId: "slack",
+          providerSetting: params.cfg.channels?.slack?.commands?.nativeSkills,
+          globalSetting: params.cfg.commands?.nativeSkills,
+        }));
+
     findings.push({
       checkId: "plugins.extensions_no_allowlist",
-      severity: "warn",
+      severity: skillCommandsLikelyExposed ? "critical" : "warn",
       title: "Extensions exist but plugins.allow is not set",
-      detail: `Found ${pluginDirs.length} extension(s) under ${extensionsDir}. Without plugins.allow, any discovered plugin id may load (depending on config and plugin behavior).`,
+      detail:
+        `Found ${pluginDirs.length} extension(s) under ${extensionsDir}. Without plugins.allow, any discovered plugin id may load (depending on config and plugin behavior).` +
+        (skillCommandsLikelyExposed
+          ? "\nNative skill commands are enabled on at least one configured chat surface; treat unpinned/unallowlisted extensions as high risk."
+          : ""),
       remediation: "Set plugins.allow to an explicit list of plugin ids you trust.",
     });
   }
@@ -338,21 +700,32 @@ function resolveIncludePath(baseConfigPath: string, includePath: string): string
 function listDirectIncludes(parsed: unknown): string[] {
   const out: string[] = [];
   const visit = (value: unknown) => {
-    if (!value) return;
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
+    if (!value) {
       return;
     }
-    if (typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item);
+      }
+      return;
+    }
+    if (typeof value !== "object") {
+      return;
+    }
     const rec = value as Record<string, unknown>;
     const includeVal = rec[INCLUDE_KEY];
-    if (typeof includeVal === "string") out.push(includeVal);
-    else if (Array.isArray(includeVal)) {
+    if (typeof includeVal === "string") {
+      out.push(includeVal);
+    } else if (Array.isArray(includeVal)) {
       for (const item of includeVal) {
-        if (typeof item === "string") out.push(item);
+        if (typeof item === "string") {
+          out.push(item);
+        }
       }
     }
-    for (const v of Object.values(rec)) visit(v);
+    for (const v of Object.values(rec)) {
+      visit(v);
+    }
   };
   visit(parsed);
   return out;
@@ -366,17 +739,23 @@ async function collectIncludePathsRecursive(params: {
   const result: string[] = [];
 
   const walk = async (basePath: string, parsed: unknown, depth: number): Promise<void> => {
-    if (depth > MAX_INCLUDE_DEPTH) return;
+    if (depth > MAX_INCLUDE_DEPTH) {
+      return;
+    }
     for (const raw of listDirectIncludes(parsed)) {
       const resolved = resolveIncludePath(basePath, raw);
-      if (visited.has(resolved)) continue;
+      if (visited.has(resolved)) {
+        continue;
+      }
       visited.add(resolved);
       result.push(resolved);
       const rawText = await fs.readFile(resolved, "utf-8").catch(() => null);
-      if (!rawText) continue;
+      if (!rawText) {
+        continue;
+      }
       const nestedParsed = (() => {
         try {
-          return JSON5.parse(rawText) as unknown;
+          return JSON5.parse(rawText);
         } catch {
           return null;
         }
@@ -394,45 +773,75 @@ async function collectIncludePathsRecursive(params: {
 
 export async function collectIncludeFilePermFindings(params: {
   configSnapshot: ConfigFileSnapshot;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  execIcacls?: ExecFn;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
-  if (!params.configSnapshot.exists) return findings;
+  if (!params.configSnapshot.exists) {
+    return findings;
+  }
 
   const configPath = params.configSnapshot.path;
   const includePaths = await collectIncludePathsRecursive({
     configPath,
     parsed: params.configSnapshot.parsed,
   });
-  if (includePaths.length === 0) return findings;
+  if (includePaths.length === 0) {
+    return findings;
+  }
 
   for (const p of includePaths) {
     // eslint-disable-next-line no-await-in-loop
-    const st = await safeStat(p);
-    if (!st.ok) continue;
-    const bits = modeBits(st.mode);
-    if (isWorldWritable(bits) || isGroupWritable(bits)) {
+    const perms = await inspectPathPermissions(p, {
+      env: params.env,
+      platform: params.platform,
+      exec: params.execIcacls,
+    });
+    if (!perms.ok) {
+      continue;
+    }
+    if (perms.worldWritable || perms.groupWritable) {
       findings.push({
         checkId: "fs.config_include.perms_writable",
         severity: "critical",
         title: "Config include file is writable by others",
-        detail: `${p} mode=${formatOctal(bits)}; another user could influence your effective config.`,
-        remediation: `chmod 600 ${p}`,
+        detail: `${formatPermissionDetail(p, perms)}; another user could influence your effective config.`,
+        remediation: formatPermissionRemediation({
+          targetPath: p,
+          perms,
+          isDir: false,
+          posixMode: 0o600,
+          env: params.env,
+        }),
       });
-    } else if (isWorldReadable(bits)) {
+    } else if (perms.worldReadable) {
       findings.push({
         checkId: "fs.config_include.perms_world_readable",
         severity: "critical",
         title: "Config include file is world-readable",
-        detail: `${p} mode=${formatOctal(bits)}; include files can contain tokens and private settings.`,
-        remediation: `chmod 600 ${p}`,
+        detail: `${formatPermissionDetail(p, perms)}; include files can contain tokens and private settings.`,
+        remediation: formatPermissionRemediation({
+          targetPath: p,
+          perms,
+          isDir: false,
+          posixMode: 0o600,
+          env: params.env,
+        }),
       });
-    } else if (isGroupReadable(bits)) {
+    } else if (perms.groupReadable) {
       findings.push({
         checkId: "fs.config_include.perms_group_readable",
         severity: "warn",
         title: "Config include file is group-readable",
-        detail: `${p} mode=${formatOctal(bits)}; include files can contain tokens and private settings.`,
-        remediation: `chmod 600 ${p}`,
+        detail: `${formatPermissionDetail(p, perms)}; include files can contain tokens and private settings.`,
+        remediation: formatPermissionRemediation({
+          targetPath: p,
+          perms,
+          isDir: false,
+          posixMode: 0o600,
+          env: params.env,
+        }),
       });
     }
   }
@@ -441,31 +850,48 @@ export async function collectIncludeFilePermFindings(params: {
 }
 
 export async function collectStateDeepFilesystemFindings(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   env: NodeJS.ProcessEnv;
   stateDir: string;
+  platform?: NodeJS.Platform;
+  execIcacls?: ExecFn;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
   const oauthDir = resolveOAuthDir(params.env, params.stateDir);
 
-  const oauthStat = await safeStat(oauthDir);
-  if (oauthStat.ok && oauthStat.isDir) {
-    const bits = modeBits(oauthStat.mode);
-    if (isWorldWritable(bits) || isGroupWritable(bits)) {
+  const oauthPerms = await inspectPathPermissions(oauthDir, {
+    env: params.env,
+    platform: params.platform,
+    exec: params.execIcacls,
+  });
+  if (oauthPerms.ok && oauthPerms.isDir) {
+    if (oauthPerms.worldWritable || oauthPerms.groupWritable) {
       findings.push({
         checkId: "fs.credentials_dir.perms_writable",
         severity: "critical",
         title: "Credentials dir is writable by others",
-        detail: `${oauthDir} mode=${formatOctal(bits)}; another user could drop/modify credential files.`,
-        remediation: `chmod 700 ${oauthDir}`,
+        detail: `${formatPermissionDetail(oauthDir, oauthPerms)}; another user could drop/modify credential files.`,
+        remediation: formatPermissionRemediation({
+          targetPath: oauthDir,
+          perms: oauthPerms,
+          isDir: true,
+          posixMode: 0o700,
+          env: params.env,
+        }),
       });
-    } else if (isGroupReadable(bits) || isWorldReadable(bits)) {
+    } else if (oauthPerms.groupReadable || oauthPerms.worldReadable) {
       findings.push({
         checkId: "fs.credentials_dir.perms_readable",
         severity: "warn",
         title: "Credentials dir is readable by others",
-        detail: `${oauthDir} mode=${formatOctal(bits)}; credentials and allowlists can be sensitive.`,
-        remediation: `chmod 700 ${oauthDir}`,
+        detail: `${formatPermissionDetail(oauthDir, oauthPerms)}; credentials and allowlists can be sensitive.`,
+        remediation: formatPermissionRemediation({
+          targetPath: oauthDir,
+          perms: oauthPerms,
+          isDir: true,
+          posixMode: 0o700,
+          env: params.env,
+        }),
       });
     }
   }
@@ -482,40 +908,64 @@ export async function collectStateDeepFilesystemFindings(params: {
     const agentDir = path.join(params.stateDir, "agents", agentId, "agent");
     const authPath = path.join(agentDir, "auth-profiles.json");
     // eslint-disable-next-line no-await-in-loop
-    const authStat = await safeStat(authPath);
-    if (authStat.ok) {
-      const bits = modeBits(authStat.mode);
-      if (isWorldWritable(bits) || isGroupWritable(bits)) {
+    const authPerms = await inspectPathPermissions(authPath, {
+      env: params.env,
+      platform: params.platform,
+      exec: params.execIcacls,
+    });
+    if (authPerms.ok) {
+      if (authPerms.worldWritable || authPerms.groupWritable) {
         findings.push({
           checkId: "fs.auth_profiles.perms_writable",
           severity: "critical",
           title: "auth-profiles.json is writable by others",
-          detail: `${authPath} mode=${formatOctal(bits)}; another user could inject credentials.`,
-          remediation: `chmod 600 ${authPath}`,
+          detail: `${formatPermissionDetail(authPath, authPerms)}; another user could inject credentials.`,
+          remediation: formatPermissionRemediation({
+            targetPath: authPath,
+            perms: authPerms,
+            isDir: false,
+            posixMode: 0o600,
+            env: params.env,
+          }),
         });
-      } else if (isWorldReadable(bits) || isGroupReadable(bits)) {
+      } else if (authPerms.worldReadable || authPerms.groupReadable) {
         findings.push({
           checkId: "fs.auth_profiles.perms_readable",
           severity: "warn",
           title: "auth-profiles.json is readable by others",
-          detail: `${authPath} mode=${formatOctal(bits)}; auth-profiles.json contains API keys and OAuth tokens.`,
-          remediation: `chmod 600 ${authPath}`,
+          detail: `${formatPermissionDetail(authPath, authPerms)}; auth-profiles.json contains API keys and OAuth tokens.`,
+          remediation: formatPermissionRemediation({
+            targetPath: authPath,
+            perms: authPerms,
+            isDir: false,
+            posixMode: 0o600,
+            env: params.env,
+          }),
         });
       }
     }
 
     const storePath = path.join(params.stateDir, "agents", agentId, "sessions", "sessions.json");
     // eslint-disable-next-line no-await-in-loop
-    const storeStat = await safeStat(storePath);
-    if (storeStat.ok) {
-      const bits = modeBits(storeStat.mode);
-      if (isWorldReadable(bits) || isGroupReadable(bits)) {
+    const storePerms = await inspectPathPermissions(storePath, {
+      env: params.env,
+      platform: params.platform,
+      exec: params.execIcacls,
+    });
+    if (storePerms.ok) {
+      if (storePerms.worldReadable || storePerms.groupReadable) {
         findings.push({
           checkId: "fs.sessions_store.perms_readable",
           severity: "warn",
           title: "sessions.json is readable by others",
-          detail: `${storePath} mode=${formatOctal(bits)}; routing and transcript metadata can be sensitive.`,
-          remediation: `chmod 600 ${storePath}`,
+          detail: `${formatPermissionDetail(storePath, storePerms)}; routing and transcript metadata can be sensitive.`,
+          remediation: formatPermissionRemediation({
+            targetPath: storePath,
+            perms: storePerms,
+            isDir: false,
+            posixMode: 0o600,
+            env: params.env,
+          }),
         });
       }
     }
@@ -527,16 +977,25 @@ export async function collectStateDeepFilesystemFindings(params: {
     const expanded = logFile.startsWith("~") ? expandTilde(logFile, params.env) : logFile;
     if (expanded) {
       const logPath = path.resolve(expanded);
-      const st = await safeStat(logPath);
-      if (st.ok) {
-        const bits = modeBits(st.mode);
-        if (isWorldReadable(bits) || isGroupReadable(bits)) {
+      const logPerms = await inspectPathPermissions(logPath, {
+        env: params.env,
+        platform: params.platform,
+        exec: params.execIcacls,
+      });
+      if (logPerms.ok) {
+        if (logPerms.worldReadable || logPerms.groupReadable) {
           findings.push({
             checkId: "fs.log_file.perms_readable",
             severity: "warn",
             title: "Log file is readable by others",
-            detail: `${logPath} mode=${formatOctal(bits)}; logs can contain private messages and tool output.`,
-            remediation: `chmod 600 ${logPath}`,
+            detail: `${formatPermissionDetail(logPath, logPerms)}; logs can contain private messages and tool output.`,
+            remediation: formatPermissionRemediation({
+              targetPath: logPath,
+              perms: logPerms,
+              isDir: false,
+              posixMode: 0o600,
+              env: params.env,
+            }),
           });
         }
       }
@@ -546,31 +1005,42 @@ export async function collectStateDeepFilesystemFindings(params: {
   return findings;
 }
 
-function listGroupPolicyOpen(cfg: ClawdbotConfig): string[] {
+function listGroupPolicyOpen(cfg: OpenClawConfig): string[] {
   const out: string[] = [];
   const channels = cfg.channels as Record<string, unknown> | undefined;
-  if (!channels || typeof channels !== "object") return out;
+  if (!channels || typeof channels !== "object") {
+    return out;
+  }
   for (const [channelId, value] of Object.entries(channels)) {
-    if (!value || typeof value !== "object") continue;
+    if (!value || typeof value !== "object") {
+      continue;
+    }
     const section = value as Record<string, unknown>;
-    if (section.groupPolicy === "open") out.push(`channels.${channelId}.groupPolicy`);
+    if (section.groupPolicy === "open") {
+      out.push(`channels.${channelId}.groupPolicy`);
+    }
     const accounts = section.accounts;
     if (accounts && typeof accounts === "object") {
       for (const [accountId, accountVal] of Object.entries(accounts)) {
-        if (!accountVal || typeof accountVal !== "object") continue;
+        if (!accountVal || typeof accountVal !== "object") {
+          continue;
+        }
         const acc = accountVal as Record<string, unknown>;
-        if (acc.groupPolicy === "open")
+        if (acc.groupPolicy === "open") {
           out.push(`channels.${channelId}.accounts.${accountId}.groupPolicy`);
+        }
       }
     }
   }
   return out;
 }
 
-export function collectExposureMatrixFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+export function collectExposureMatrixFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const openGroups = listGroupPolicyOpen(cfg);
-  if (openGroups.length === 0) return findings;
+  if (openGroups.length === 0) {
+    return findings;
+  }
 
   const elevatedEnabled = cfg.tools?.elevated?.enabled !== false;
   if (elevatedEnabled) {
@@ -596,4 +1066,240 @@ export async function readConfigSnapshotForAudit(params: {
     env: params.env,
     configPath: params.configPath,
   }).readConfigFileSnapshot();
+}
+
+function isPathInside(basePath: string, candidatePath: string): boolean {
+  const base = path.resolve(basePath);
+  const candidate = path.resolve(candidatePath);
+  const rel = path.relative(base, candidate);
+  return rel === "" || (!rel.startsWith(`..${path.sep}`) && rel !== ".." && !path.isAbsolute(rel));
+}
+
+function extensionUsesSkippedScannerPath(entry: string): boolean {
+  const segments = entry.split(/[\\/]+/).filter(Boolean);
+  return segments.some(
+    (segment) =>
+      segment === "node_modules" ||
+      (segment.startsWith(".") && segment !== "." && segment !== ".."),
+  );
+}
+
+async function readPluginManifestExtensions(pluginPath: string): Promise<string[]> {
+  const manifestPath = path.join(pluginPath, "package.json");
+  const raw = await fs.readFile(manifestPath, "utf-8").catch(() => "");
+  if (!raw.trim()) {
+    return [];
+  }
+
+  const parsed = JSON.parse(raw) as Partial<
+    Record<typeof MANIFEST_KEY, { extensions?: unknown }>
+  > | null;
+  const extensions = parsed?.[MANIFEST_KEY]?.extensions;
+  if (!Array.isArray(extensions)) {
+    return [];
+  }
+  return extensions.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
+}
+
+function listWorkspaceDirs(cfg: OpenClawConfig): string[] {
+  const dirs = new Set<string>();
+  const list = cfg.agents?.list;
+  if (Array.isArray(list)) {
+    for (const entry of list) {
+      if (entry && typeof entry === "object" && typeof entry.id === "string") {
+        dirs.add(resolveAgentWorkspaceDir(cfg, entry.id));
+      }
+    }
+  }
+  dirs.add(resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg)));
+  return [...dirs];
+}
+
+function formatCodeSafetyDetails(findings: SkillScanFinding[], rootDir: string): string {
+  return findings
+    .map((finding) => {
+      const relPath = path.relative(rootDir, finding.file);
+      const filePath =
+        relPath && relPath !== "." && !relPath.startsWith("..")
+          ? relPath
+          : path.basename(finding.file);
+      const normalizedPath = filePath.replaceAll("\\", "/");
+      return `  - [${finding.ruleId}] ${finding.message} (${normalizedPath}:${finding.line})`;
+    })
+    .join("\n");
+}
+
+export async function collectPluginsCodeSafetyFindings(params: {
+  stateDir: string;
+}): Promise<SecurityAuditFinding[]> {
+  const findings: SecurityAuditFinding[] = [];
+  const extensionsDir = path.join(params.stateDir, "extensions");
+  const st = await safeStat(extensionsDir);
+  if (!st.ok || !st.isDir) {
+    return findings;
+  }
+
+  const entries = await fs.readdir(extensionsDir, { withFileTypes: true }).catch((err) => {
+    findings.push({
+      checkId: "plugins.code_safety.scan_failed",
+      severity: "warn",
+      title: "Plugin extensions directory scan failed",
+      detail: `Static code scan could not list extensions directory: ${String(err)}`,
+      remediation:
+        "Check file permissions and plugin layout, then rerun `openclaw security audit --deep`.",
+    });
+    return [];
+  });
+  const pluginDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+
+  for (const pluginName of pluginDirs) {
+    const pluginPath = path.join(extensionsDir, pluginName);
+    const extensionEntries = await readPluginManifestExtensions(pluginPath).catch(() => []);
+    const forcedScanEntries: string[] = [];
+    const escapedEntries: string[] = [];
+
+    for (const entry of extensionEntries) {
+      const resolvedEntry = path.resolve(pluginPath, entry);
+      if (!isPathInside(pluginPath, resolvedEntry)) {
+        escapedEntries.push(entry);
+        continue;
+      }
+      if (extensionUsesSkippedScannerPath(entry)) {
+        findings.push({
+          checkId: "plugins.code_safety.entry_path",
+          severity: "warn",
+          title: `Plugin "${pluginName}" entry path is hidden or node_modules`,
+          detail: `Extension entry "${entry}" points to a hidden or node_modules path. Deep code scan will cover this entry explicitly, but review this path choice carefully.`,
+          remediation: "Prefer extension entrypoints under normal source paths like dist/ or src/.",
+        });
+      }
+      forcedScanEntries.push(resolvedEntry);
+    }
+
+    if (escapedEntries.length > 0) {
+      findings.push({
+        checkId: "plugins.code_safety.entry_escape",
+        severity: "critical",
+        title: `Plugin "${pluginName}" has extension entry path traversal`,
+        detail: `Found extension entries that escape the plugin directory:\n${escapedEntries.map((entry) => `  - ${entry}`).join("\n")}`,
+        remediation:
+          "Update the plugin manifest so all openclaw.extensions entries stay inside the plugin directory.",
+      });
+    }
+
+    const summary = await scanDirectoryWithSummary(pluginPath, {
+      includeFiles: forcedScanEntries,
+    }).catch((err) => {
+      findings.push({
+        checkId: "plugins.code_safety.scan_failed",
+        severity: "warn",
+        title: `Plugin "${pluginName}" code scan failed`,
+        detail: `Static code scan could not complete: ${String(err)}`,
+        remediation:
+          "Check file permissions and plugin layout, then rerun `openclaw security audit --deep`.",
+      });
+      return null;
+    });
+    if (!summary) {
+      continue;
+    }
+
+    if (summary.critical > 0) {
+      const criticalFindings = summary.findings.filter((f) => f.severity === "critical");
+      const details = formatCodeSafetyDetails(criticalFindings, pluginPath);
+
+      findings.push({
+        checkId: "plugins.code_safety",
+        severity: "critical",
+        title: `Plugin "${pluginName}" contains dangerous code patterns`,
+        detail: `Found ${summary.critical} critical issue(s) in ${summary.scannedFiles} scanned file(s):\n${details}`,
+        remediation:
+          "Review the plugin source code carefully before use. If untrusted, remove the plugin from your OpenClaw extensions state directory.",
+      });
+    } else if (summary.warn > 0) {
+      const warnFindings = summary.findings.filter((f) => f.severity === "warn");
+      const details = formatCodeSafetyDetails(warnFindings, pluginPath);
+
+      findings.push({
+        checkId: "plugins.code_safety",
+        severity: "warn",
+        title: `Plugin "${pluginName}" contains suspicious code patterns`,
+        detail: `Found ${summary.warn} warning(s) in ${summary.scannedFiles} scanned file(s):\n${details}`,
+        remediation: `Review the flagged code to ensure it is intentional and safe.`,
+      });
+    }
+  }
+
+  return findings;
+}
+
+export async function collectInstalledSkillsCodeSafetyFindings(params: {
+  cfg: OpenClawConfig;
+  stateDir: string;
+}): Promise<SecurityAuditFinding[]> {
+  const findings: SecurityAuditFinding[] = [];
+  const pluginExtensionsDir = path.join(params.stateDir, "extensions");
+  const scannedSkillDirs = new Set<string>();
+  const workspaceDirs = listWorkspaceDirs(params.cfg);
+
+  for (const workspaceDir of workspaceDirs) {
+    const entries = loadWorkspaceSkillEntries(workspaceDir, { config: params.cfg });
+    for (const entry of entries) {
+      if (entry.skill.source === "openclaw-bundled") {
+        continue;
+      }
+
+      const skillDir = path.resolve(entry.skill.baseDir);
+      if (isPathInside(pluginExtensionsDir, skillDir)) {
+        // Plugin code is already covered by plugins.code_safety checks.
+        continue;
+      }
+      if (scannedSkillDirs.has(skillDir)) {
+        continue;
+      }
+      scannedSkillDirs.add(skillDir);
+
+      const skillName = entry.skill.name;
+      const summary = await scanDirectoryWithSummary(skillDir).catch((err) => {
+        findings.push({
+          checkId: "skills.code_safety.scan_failed",
+          severity: "warn",
+          title: `Skill "${skillName}" code scan failed`,
+          detail: `Static code scan could not complete for ${skillDir}: ${String(err)}`,
+          remediation:
+            "Check file permissions and skill layout, then rerun `openclaw security audit --deep`.",
+        });
+        return null;
+      });
+      if (!summary) {
+        continue;
+      }
+
+      if (summary.critical > 0) {
+        const criticalFindings = summary.findings.filter(
+          (finding) => finding.severity === "critical",
+        );
+        const details = formatCodeSafetyDetails(criticalFindings, skillDir);
+        findings.push({
+          checkId: "skills.code_safety",
+          severity: "critical",
+          title: `Skill "${skillName}" contains dangerous code patterns`,
+          detail: `Found ${summary.critical} critical issue(s) in ${summary.scannedFiles} scanned file(s) under ${skillDir}:\n${details}`,
+          remediation: `Review the skill source code before use. If untrusted, remove "${skillDir}".`,
+        });
+      } else if (summary.warn > 0) {
+        const warnFindings = summary.findings.filter((finding) => finding.severity === "warn");
+        const details = formatCodeSafetyDetails(warnFindings, skillDir);
+        findings.push({
+          checkId: "skills.code_safety",
+          severity: "warn",
+          title: `Skill "${skillName}" contains suspicious code patterns`,
+          detail: `Found ${summary.warn} warning(s) in ${summary.scannedFiles} scanned file(s) under ${skillDir}:\n${details}`,
+          remediation: "Review flagged lines to ensure the behavior is intentional and safe.",
+        });
+      }
+    }
+  }
+
+  return findings;
 }

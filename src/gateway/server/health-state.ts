@@ -1,7 +1,10 @@
-import { getHealthSnapshot, type HealthSummary } from "../../commands/health.js";
-import { CONFIG_PATH_CLAWDBOT, STATE_DIR_CLAWDBOT } from "../../config/config.js";
-import { listSystemPresence } from "../../infra/system-presence.js";
 import type { Snapshot } from "../protocol/index.js";
+import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import { getHealthSnapshot, type HealthSummary } from "../../commands/health.js";
+import { CONFIG_PATH, STATE_DIR, loadConfig } from "../../config/config.js";
+import { resolveMainSessionKey } from "../../config/sessions.js";
+import { listSystemPresence } from "../../infra/system-presence.js";
+import { normalizeMainKey } from "../../routing/session-key.js";
 
 let presenceVersion = 1;
 let healthVersion = 1;
@@ -10,6 +13,11 @@ let healthRefresh: Promise<HealthSummary> | null = null;
 let broadcastHealthUpdate: ((snap: HealthSummary) => void) | null = null;
 
 export function buildGatewaySnapshot(): Snapshot {
+  const cfg = loadConfig();
+  const defaultAgentId = resolveDefaultAgentId(cfg);
+  const mainKey = normalizeMainKey(cfg.session?.mainKey);
+  const mainSessionKey = resolveMainSessionKey(cfg);
+  const scope = cfg.session?.scope ?? "per-sender";
   const presence = listSystemPresence();
   const uptimeMs = Math.round(process.uptime() * 1000);
   // Health is async; caller should await getHealthSnapshot and replace later if needed.
@@ -20,8 +28,14 @@ export function buildGatewaySnapshot(): Snapshot {
     stateVersion: { presence: presenceVersion, health: healthVersion },
     uptimeMs,
     // Surface resolved paths so UIs can display the true config location.
-    configPath: CONFIG_PATH_CLAWDBOT,
-    stateDir: STATE_DIR_CLAWDBOT,
+    configPath: CONFIG_PATH,
+    stateDir: STATE_DIR,
+    sessionDefaults: {
+      defaultAgentId,
+      mainKey,
+      mainSessionKey,
+      scope,
+    },
   };
 }
 

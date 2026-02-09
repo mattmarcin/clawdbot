@@ -1,7 +1,8 @@
-import crypto from "node:crypto";
-
 import { Type } from "@sinclair/typebox";
-
+import crypto from "node:crypto";
+import type { GatewayMessageChannel } from "../../utils/message-channel.js";
+import type { AnyAgentTool } from "./common.js";
+import { formatThinkingLevels, normalizeThinkLevel } from "../../auto-reply/thinking.js";
 import { loadConfig } from "../../config/config.js";
 import { callGateway } from "../../gateway/call.js";
 import {
@@ -9,13 +10,12 @@ import {
   normalizeAgentId,
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
-import type { GatewayMessageChannel } from "../../utils/message-channel.js";
+import { normalizeDeliveryContext } from "../../utils/delivery-context.js";
 import { resolveAgentConfig } from "../agent-scope.js";
 import { AGENT_LANE_SUBAGENT } from "../lanes.js";
 import { optionalStringEnum } from "../schema/typebox.js";
 import { buildSubagentSystemPrompt } from "../subagent-announce.js";
 import { registerSubagentRun } from "../subagent-registry.js";
-import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readStringParam } from "./common.js";
 import {
   resolveDisplaySessionKey,
@@ -28,27 +28,55 @@ const SessionsSpawnToolSchema = Type.Object({
   label: Type.Optional(Type.String()),
   agentId: Type.Optional(Type.String()),
   model: Type.Optional(Type.String()),
+  thinking: Type.Optional(Type.String()),
   runTimeoutSeconds: Type.Optional(Type.Number({ minimum: 0 })),
   // Back-compat alias. Prefer runTimeoutSeconds.
   timeoutSeconds: Type.Optional(Type.Number({ minimum: 0 })),
   cleanup: optionalStringEnum(["delete", "keep"] as const),
 });
 
+function splitModelRef(ref?: string) {
+  if (!ref) {
+    return { provider: undefined, model: undefined };
+  }
+  const trimmed = ref.trim();
+  if (!trimmed) {
+    return { provider: undefined, model: undefined };
+  }
+  const [provider, model] = trimmed.split("/", 2);
+  if (model) {
+    return { provider, model };
+  }
+  return { provider: undefined, model: trimmed };
+}
+
 function normalizeModelSelection(value: unknown): string | undefined {
   if (typeof value === "string") {
     const trimmed = value.trim();
     return trimmed || undefined;
   }
-  if (!value || typeof value !== "object") return undefined;
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
   const primary = (value as { primary?: unknown }).primary;
-  if (typeof primary === "string" && primary.trim()) return primary.trim();
+  if (typeof primary === "string" && primary.trim()) {
+    return primary.trim();
+  }
   return undefined;
 }
 
 export function createSessionsSpawnTool(opts?: {
   agentSessionKey?: string;
   agentChannel?: GatewayMessageChannel;
+  agentAccountId?: string;
+  agentTo?: string;
+  agentThreadId?: string | number;
+  agentGroupId?: string | null;
+  agentGroupChannel?: string | null;
+  agentGroupSpace?: string | null;
   sandboxed?: boolean;
+  /** Explicit agent ID override for cron/hook sessions where session key parsing may not work. */
+  requesterAgentIdOverride?: string;
 }): AnyAgentTool {
   return {
     label: "Sessions",
@@ -62,16 +90,23 @@ export function createSessionsSpawnTool(opts?: {
       const label = typeof params.label === "string" ? params.label.trim() : "";
       const requestedAgentId = readStringParam(params, "agentId");
       const modelOverride = readStringParam(params, "model");
+      const thinkingOverrideRaw = readStringParam(params, "thinking");
       const cleanup =
-        params.cleanup === "keep" || params.cleanup === "delete"
-          ? (params.cleanup as "keep" | "delete")
-          : "keep";
+        params.cleanup === "keep" || params.cleanup === "delete" ? params.cleanup : "keep";
+      const requesterOrigin = normalizeDeliveryContext({
+        channel: opts?.agentChannel,
+        accountId: opts?.agentAccountId,
+        to: opts?.agentTo,
+        threadId: opts?.agentThreadId,
+      });
       const runTimeoutSeconds = (() => {
         const explicit =
           typeof params.runTimeoutSeconds === "number" && Number.isFinite(params.runTimeoutSeconds)
             ? Math.max(0, Math.floor(params.runTimeoutSeconds))
             : undefined;
-        if (explicit !== undefined) return explicit;
+        if (explicit !== undefined) {
+          return explicit;
+        }
         const legacy =
           typeof params.timeoutSeconds === "number" && Number.isFinite(params.timeoutSeconds)
             ? Math.max(0, Math.floor(params.timeoutSeconds))
@@ -104,7 +139,7 @@ export function createSessionsSpawnTool(opts?: {
       });
 
       const requesterAgentId = normalizeAgentId(
-        parseAgentSessionKey(requesterInternalKey)?.agentId,
+        opts?.requesterAgentIdOverride ?? parseAgentSessionKey(requesterInternalKey)?.agentId,
       );
       const targetAgentId = requestedAgentId
         ? normalizeAgentId(requestedAgentId)
@@ -131,12 +166,31 @@ export function createSessionsSpawnTool(opts?: {
         }
       }
       const childSessionKey = `agent:${targetAgentId}:subagent:${crypto.randomUUID()}`;
-      const shouldPatchSpawnedBy = opts?.sandboxed === true;
+      const spawnedByKey = requesterInternalKey;
       const targetAgentConfig = resolveAgentConfig(cfg, targetAgentId);
       const resolvedModel =
         normalizeModelSelection(modelOverride) ??
         normalizeModelSelection(targetAgentConfig?.subagents?.model) ??
         normalizeModelSelection(cfg.agents?.defaults?.subagents?.model);
+
+      const resolvedThinkingDefaultRaw =
+        readStringParam(targetAgentConfig?.subagents ?? {}, "thinking") ??
+        readStringParam(cfg.agents?.defaults?.subagents ?? {}, "thinking");
+
+      let thinkingOverride: string | undefined;
+      const thinkingCandidateRaw = thinkingOverrideRaw || resolvedThinkingDefaultRaw;
+      if (thinkingCandidateRaw) {
+        const normalized = normalizeThinkLevel(thinkingCandidateRaw);
+        if (!normalized) {
+          const { provider, model } = splitModelRef(resolvedModel);
+          const hint = formatThinkingLevels(provider, model);
+          return jsonResult({
+            status: "error",
+            error: `Invalid thinking level "${thinkingCandidateRaw}". Use one of: ${hint}.`,
+          });
+        }
+        thinkingOverride = normalized;
+      }
       if (resolvedModel) {
         try {
           await callGateway({
@@ -160,9 +214,29 @@ export function createSessionsSpawnTool(opts?: {
           modelWarning = messageText;
         }
       }
+      if (thinkingOverride !== undefined) {
+        try {
+          await callGateway({
+            method: "sessions.patch",
+            params: {
+              key: childSessionKey,
+              thinkingLevel: thinkingOverride === "off" ? null : thinkingOverride,
+            },
+            timeoutMs: 10_000,
+          });
+        } catch (err) {
+          const messageText =
+            err instanceof Error ? err.message : typeof err === "string" ? err : "error";
+          return jsonResult({
+            status: "error",
+            error: messageText,
+            childSessionKey,
+          });
+        }
+      }
       const childSystemPrompt = buildSubagentSystemPrompt({
         requesterSessionKey,
-        requesterChannel: opts?.agentChannel,
+        requesterOrigin,
         childSessionKey,
         label: label || undefined,
         task,
@@ -171,22 +245,30 @@ export function createSessionsSpawnTool(opts?: {
       const childIdem = crypto.randomUUID();
       let childRunId: string = childIdem;
       try {
-        const response = (await callGateway({
+        const response = await callGateway<{ runId: string }>({
           method: "agent",
           params: {
             message: task,
             sessionKey: childSessionKey,
-            channel: opts?.agentChannel,
+            channel: requesterOrigin?.channel,
+            to: requesterOrigin?.to ?? undefined,
+            accountId: requesterOrigin?.accountId ?? undefined,
+            threadId:
+              requesterOrigin?.threadId != null ? String(requesterOrigin.threadId) : undefined,
             idempotencyKey: childIdem,
             deliver: false,
             lane: AGENT_LANE_SUBAGENT,
             extraSystemPrompt: childSystemPrompt,
+            thinking: thinkingOverride,
             timeout: runTimeoutSeconds > 0 ? runTimeoutSeconds : undefined,
             label: label || undefined,
-            spawnedBy: shouldPatchSpawnedBy ? requesterInternalKey : undefined,
+            spawnedBy: spawnedByKey,
+            groupId: opts?.agentGroupId ?? undefined,
+            groupChannel: opts?.agentGroupChannel ?? undefined,
+            groupSpace: opts?.agentGroupSpace ?? undefined,
           },
           timeoutMs: 10_000,
-        })) as { runId?: string };
+        });
         if (typeof response?.runId === "string" && response.runId) {
           childRunId = response.runId;
         }
@@ -205,7 +287,7 @@ export function createSessionsSpawnTool(opts?: {
         runId: childRunId,
         childSessionKey,
         requesterSessionKey: requesterInternalKey,
-        requesterChannel: opts?.agentChannel,
+        requesterOrigin,
         requesterDisplayKey,
         task,
         cleanup,

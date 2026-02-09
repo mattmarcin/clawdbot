@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_AGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_CONCURRENT } from "./agent-limits.js";
 import { withTempHome } from "./test-helpers.js";
 
 describe("config identity defaults", () => {
@@ -16,10 +17,10 @@ describe("config identity defaults", () => {
 
   it("does not derive mentionPatterns when identity is set", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             agents: {
@@ -53,10 +54,10 @@ describe("config identity defaults", () => {
 
   it("defaults ackReactionScope without setting ackReaction", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             agents: {
@@ -90,10 +91,10 @@ describe("config identity defaults", () => {
 
   it("keeps ackReaction unset when identity is missing", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             messages: {},
@@ -115,10 +116,10 @@ describe("config identity defaults", () => {
 
   it("does not override explicit values", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             agents: {
@@ -130,7 +131,7 @@ describe("config identity defaults", () => {
                     theme: "space lobster",
                     emoji: "🦞",
                   },
-                  groupChat: { mentionPatterns: ["@clawd"] },
+                  groupChat: { mentionPatterns: ["@openclaw"] },
                 },
               ],
             },
@@ -149,23 +150,21 @@ describe("config identity defaults", () => {
       const cfg = loadConfig();
 
       expect(cfg.messages?.responsePrefix).toBe("✅");
-      expect(cfg.agents?.list?.[0]?.groupChat?.mentionPatterns).toEqual(["@clawd"]);
+      expect(cfg.agents?.list?.[0]?.groupChat?.mentionPatterns).toEqual(["@openclaw"]);
     });
   });
 
   it("supports provider textChunkLimit config", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             messages: {
-              messagePrefix: "[clawdbot]",
+              messagePrefix: "[openclaw]",
               responsePrefix: "🦞",
-              // legacy field should be ignored (moved to providers)
-              textChunkLimit: 9999,
             },
             channels: {
               whatsapp: { allowFrom: ["+15555550123"], textChunkLimit: 4444 },
@@ -203,10 +202,10 @@ describe("config identity defaults", () => {
 
   it("accepts blank model provider apiKey values", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             models: {
@@ -252,10 +251,10 @@ describe("config identity defaults", () => {
 
   it("respects empty responsePrefix to disable identity defaults", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             agents: {
@@ -286,12 +285,12 @@ describe("config identity defaults", () => {
     });
   });
 
-  it("does not synthesize agent/session when absent", async () => {
+  it("does not synthesize agent list/session when absent", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             messages: {},
@@ -308,17 +307,19 @@ describe("config identity defaults", () => {
 
       expect(cfg.messages?.responsePrefix).toBeUndefined();
       expect(cfg.messages?.groupChat?.mentionPatterns).toBeUndefined();
-      expect(cfg.agents).toBeUndefined();
+      expect(cfg.agents?.list).toBeUndefined();
+      expect(cfg.agents?.defaults?.maxConcurrent).toBe(DEFAULT_AGENT_MAX_CONCURRENT);
+      expect(cfg.agents?.defaults?.subagents?.maxConcurrent).toBe(DEFAULT_SUBAGENT_MAX_CONCURRENT);
       expect(cfg.session).toBeUndefined();
     });
   });
 
   it("does not derive responsePrefix from identity emoji", async () => {
     await withTempHome(async (home) => {
-      const configDir = path.join(home, ".clawdbot");
+      const configDir = path.join(home, ".openclaw");
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(
-        path.join(configDir, "clawdbot.json"),
+        path.join(configDir, "openclaw.json"),
         JSON.stringify(
           {
             agents: {
@@ -326,7 +327,7 @@ describe("config identity defaults", () => {
                 {
                   id: "main",
                   identity: {
-                    name: "Clawd",
+                    name: "OpenClaw",
                     theme: "space lobster",
                     emoji: "🦞",
                   },

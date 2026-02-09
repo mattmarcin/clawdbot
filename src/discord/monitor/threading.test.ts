@@ -1,6 +1,6 @@
+import type { Client } from "@buape/carbon";
 import { describe, expect, it } from "vitest";
 import { buildAgentSessionKey } from "../../routing/resolve-route.js";
-import type { Client } from "@buape/carbon";
 import {
   resolveDiscordAutoThreadContext,
   resolveDiscordAutoThreadReplyPlan,
@@ -28,7 +28,7 @@ describe("resolveDiscordAutoThreadContext", () => {
     });
     expect(context).not.toBeNull();
     expect(context?.To).toBe("channel:thread");
-    expect(context?.From).toBe("group:thread");
+    expect(context?.From).toBe("discord:channel:thread");
     expect(context?.OriginatingTo).toBe("channel:thread");
     expect(context?.SessionKey).toBe(
       buildAgentSessionKey({

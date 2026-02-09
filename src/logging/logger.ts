@@ -1,21 +1,23 @@
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
-
 import { Logger as TsLogger } from "tslog";
-
-import { type ClawdbotConfig, loadConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.js";
 import type { ConsoleStyle } from "./console.js";
+import { readLoggingConfig } from "./config.js";
 import { type LogLevel, levelToMinLevel, normalizeLogLevel } from "./levels.js";
 import { loggingState } from "./state.js";
 
 // Pin to /tmp so mac Debug UI and docs match; os.tmpdir() can be a per-user
 // randomized path on macOS which made the “Open log” button a no-op.
-export const DEFAULT_LOG_DIR = "/tmp/clawdbot";
-export const DEFAULT_LOG_FILE = path.join(DEFAULT_LOG_DIR, "clawdbot.log"); // legacy single-file path
+export const DEFAULT_LOG_DIR = "/tmp/openclaw";
+export const DEFAULT_LOG_FILE = path.join(DEFAULT_LOG_DIR, "openclaw.log"); // legacy single-file path
 
-const LOG_PREFIX = "clawdbot";
+const LOG_PREFIX = "openclaw";
 const LOG_SUFFIX = ".log";
 const MAX_LOG_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+
+const requireConfig = createRequire(import.meta.url);
 
 export type LoggerSettings = {
   level?: LogLevel;
@@ -31,24 +33,57 @@ type ResolvedSettings = {
   file: string;
 };
 export type LoggerResolvedSettings = ResolvedSettings;
+export type LogTransportRecord = Record<string, unknown>;
+export type LogTransport = (logObj: LogTransportRecord) => void;
+
+const externalTransports = new Set<LogTransport>();
+
+function attachExternalTransport(logger: TsLogger<LogObj>, transport: LogTransport): void {
+  logger.attachTransport((logObj: LogObj) => {
+    if (!externalTransports.has(transport)) {
+      return;
+    }
+    try {
+      transport(logObj as LogTransportRecord);
+    } catch {
+      // never block on logging failures
+    }
+  });
+}
 
 function resolveSettings(): ResolvedSettings {
-  const cfg: ClawdbotConfig["logging"] | undefined =
-    (loggingState.overrideSettings as LoggerSettings | null) ?? loadConfig().logging;
+  let cfg: OpenClawConfig["logging"] | undefined =
+    (loggingState.overrideSettings as LoggerSettings | null) ?? readLoggingConfig();
+  if (!cfg) {
+    try {
+      const loaded = requireConfig("../config/config.js") as {
+        loadConfig?: () => OpenClawConfig;
+      };
+      cfg = loaded.loadConfig?.().logging;
+    } catch {
+      cfg = undefined;
+    }
+  }
   const level = normalizeLogLevel(cfg?.level, "info");
   const file = cfg?.file ?? defaultRollingPathForToday();
   return { level, file };
 }
 
 function settingsChanged(a: ResolvedSettings | null, b: ResolvedSettings) {
-  if (!a) return true;
+  if (!a) {
+    return true;
+  }
   return a.level !== b.level || a.file !== b.file;
 }
 
 export function isFileLogLevelEnabled(level: LogLevel): boolean {
   const settings = (loggingState.cachedSettings as ResolvedSettings | null) ?? resolveSettings();
-  if (!loggingState.cachedSettings) loggingState.cachedSettings = settings;
-  if (settings.level === "silent") return false;
+  if (!loggingState.cachedSettings) {
+    loggingState.cachedSettings = settings;
+  }
+  if (settings.level === "silent") {
+    return false;
+  }
   return levelToMinLevel(level) <= levelToMinLevel(settings.level);
 }
 
@@ -59,7 +94,7 @@ function buildLogger(settings: ResolvedSettings): TsLogger<LogObj> {
     pruneOldRollingLogs(path.dirname(settings.file));
   }
   const logger = new TsLogger<LogObj>({
-    name: "clawdbot",
+    name: "openclaw",
     minLevel: levelToMinLevel(settings.level),
     type: "hidden", // no ansi formatting
   });
@@ -73,6 +108,9 @@ function buildLogger(settings: ResolvedSettings): TsLogger<LogObj> {
       // never block on logging failures
     }
   });
+  for (const transport of externalTransports) {
+    attachExternalTransport(logger, transport);
+  }
 
   return logger;
 }
@@ -154,8 +192,26 @@ export function resetLogger() {
   loggingState.overrideSettings = null;
 }
 
+export function registerLogTransport(transport: LogTransport): () => void {
+  externalTransports.add(transport);
+  const logger = loggingState.cachedLogger as TsLogger<LogObj> | null;
+  if (logger) {
+    attachExternalTransport(logger, transport);
+  }
+  return () => {
+    externalTransports.delete(transport);
+  };
+}
+
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function defaultRollingPathForToday(): string {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const today = formatLocalDate(new Date());
   return path.join(DEFAULT_LOG_DIR, `${LOG_PREFIX}-${today}${LOG_SUFFIX}`);
 }
 
@@ -173,8 +229,12 @@ function pruneOldRollingLogs(dir: string): void {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const cutoff = Date.now() - MAX_LOG_AGE_MS;
     for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      if (!entry.name.startsWith(`${LOG_PREFIX}-`) || !entry.name.endsWith(LOG_SUFFIX)) continue;
+      if (!entry.isFile()) {
+        continue;
+      }
+      if (!entry.name.startsWith(`${LOG_PREFIX}-`) || !entry.name.endsWith(LOG_SUFFIX)) {
+        continue;
+      }
       const fullPath = path.join(dir, entry.name);
       try {
         const stat = fs.statSync(fullPath);

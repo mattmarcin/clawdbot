@@ -1,12 +1,12 @@
-import { chunkText, resolveTextChunkLimit } from "../auto-reply/chunk.js";
-import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "../auto-reply/reply/history.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
-import type { ClawdbotConfig } from "../config/config.js";
-import { loadConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/config.js";
 import type { SignalReactionNotificationMode } from "../config/types.js";
-import { danger } from "../globals.js";
-import { saveMediaBuffer } from "../media/store.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { chunkTextWithMode, resolveChunkMode, resolveTextChunkLimit } from "../auto-reply/chunk.js";
+import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "../auto-reply/reply/history.js";
+import { loadConfig } from "../config/config.js";
+import { waitForTransportReady } from "../infra/transport-ready.js";
+import { saveMediaBuffer } from "../media/store.js";
 import { normalizeE164 } from "../utils.js";
 import { resolveSignalAccount } from "./accounts.js";
 import { signalCheck, signalRpcRequest } from "./client.js";
@@ -40,9 +40,10 @@ export type MonitorSignalOpts = {
   abortSignal?: AbortSignal;
   account?: string;
   accountId?: string;
-  config?: ClawdbotConfig;
+  config?: OpenClawConfig;
   baseUrl?: string;
   autoStart?: boolean;
+  startupTimeoutMs?: number;
   cliPath?: string;
   httpHost?: string;
   httpPort?: number;
@@ -94,7 +95,9 @@ function resolveSignalReactionTargets(reaction: SignalReactionMessage): SignalRe
 function isSignalReactionMessage(
   reaction: SignalReactionMessage | null | undefined,
 ): reaction is SignalReactionMessage {
-  if (!reaction) return false;
+  if (!reaction) {
+    return false;
+  }
   const emoji = reaction.emoji?.trim();
   const timestamp = reaction.targetSentTimestamp;
   const hasTarget = Boolean(reaction.targetAuthor?.trim() || reaction.targetAuthorUuid?.trim());
@@ -110,10 +113,14 @@ function shouldEmitSignalReactionNotification(params: {
 }) {
   const { mode, account, targets, sender, allowlist } = params;
   const effectiveMode = mode ?? "own";
-  if (effectiveMode === "off") return false;
+  if (effectiveMode === "off") {
+    return false;
+  }
   if (effectiveMode === "own") {
     const accountId = account?.trim();
-    if (!accountId || !targets || targets.length === 0) return false;
+    if (!accountId || !targets || targets.length === 0) {
+      return false;
+    }
     const normalizedAccount = normalizeE164(accountId);
     return targets.some((target) => {
       if (target.kind === "uuid") {
@@ -123,7 +130,9 @@ function shouldEmitSignalReactionNotification(params: {
     });
   }
   if (effectiveMode === "allowlist") {
-    if (!sender || !allowlist || allowlist.length === 0) return false;
+    if (!sender || !allowlist || allowlist.length === 0) {
+      return false;
+    }
     return isSignalSenderAllowed(sender, allowlist);
   }
   return true;
@@ -145,23 +154,29 @@ async function waitForSignalDaemonReady(params: {
   baseUrl: string;
   abortSignal?: AbortSignal;
   timeoutMs: number;
+  logAfterMs: number;
+  logIntervalMs?: number;
   runtime: RuntimeEnv;
 }): Promise<void> {
-  const started = Date.now();
-  let lastError: string | null = null;
-
-  while (Date.now() - started < params.timeoutMs) {
-    if (params.abortSignal?.aborted) return;
-    const res = await signalCheck(params.baseUrl, 1000);
-    if (res.ok) return;
-    lastError = res.error ?? (res.status ? `HTTP ${res.status}` : "unreachable");
-    await new Promise((r) => setTimeout(r, 150));
-  }
-
-  params.runtime.error?.(
-    danger(`daemon not ready after ${params.timeoutMs}ms (${lastError ?? "unknown error"})`),
-  );
-  throw new Error(`signal daemon not ready (${lastError ?? "unknown error"})`);
+  await waitForTransportReady({
+    label: "signal daemon",
+    timeoutMs: params.timeoutMs,
+    logAfterMs: params.logAfterMs,
+    logIntervalMs: params.logIntervalMs,
+    pollIntervalMs: 150,
+    abortSignal: params.abortSignal,
+    runtime: params.runtime,
+    check: async () => {
+      const res = await signalCheck(params.baseUrl, 1000);
+      if (res.ok) {
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        error: res.error ?? (res.status ? `HTTP ${res.status}` : "unreachable"),
+      };
+    },
+  });
 }
 
 async function fetchAttachment(params: {
@@ -173,7 +188,9 @@ async function fetchAttachment(params: {
   maxBytes: number;
 }): Promise<{ path: string; contentType?: string } | null> {
   const { attachment } = params;
-  if (!attachment?.id) return null;
+  if (!attachment?.id) {
+    return null;
+  }
   if (attachment.size && attachment.size > params.maxBytes) {
     throw new Error(
       `Signal attachment ${attachment.id} exceeds ${(params.maxBytes / (1024 * 1024)).toFixed(0)}MB limit`,
@@ -182,15 +199,23 @@ async function fetchAttachment(params: {
   const rpcParams: Record<string, unknown> = {
     id: attachment.id,
   };
-  if (params.account) rpcParams.account = params.account;
-  if (params.groupId) rpcParams.groupId = params.groupId;
-  else if (params.sender) rpcParams.recipient = params.sender;
-  else return null;
+  if (params.account) {
+    rpcParams.account = params.account;
+  }
+  if (params.groupId) {
+    rpcParams.groupId = params.groupId;
+  } else if (params.sender) {
+    rpcParams.recipient = params.sender;
+  } else {
+    return null;
+  }
 
   const result = await signalRpcRequest<{ data?: string }>("getAttachment", rpcParams, {
     baseUrl: params.baseUrl,
   });
-  if (!result?.data) return null;
+  if (!result?.data) {
+    return null;
+  }
   const buffer = Buffer.from(result.data, "base64");
   const saved = await saveMediaBuffer(
     buffer,
@@ -210,14 +235,18 @@ async function deliverReplies(params: {
   runtime: RuntimeEnv;
   maxBytes: number;
   textLimit: number;
+  chunkMode: "length" | "newline";
 }) {
-  const { replies, target, baseUrl, account, accountId, runtime, maxBytes, textLimit } = params;
+  const { replies, target, baseUrl, account, accountId, runtime, maxBytes, textLimit, chunkMode } =
+    params;
   for (const payload of replies) {
     const mediaList = payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
     const text = payload.text ?? "";
-    if (!text && mediaList.length === 0) continue;
+    if (!text && mediaList.length === 0) {
+      continue;
+    }
     if (mediaList.length === 0) {
-      for (const chunk of chunkText(text, textLimit)) {
+      for (const chunk of chunkTextWithMode(text, textLimit, chunkMode)) {
         await sendMessageSignal(target, chunk, {
           baseUrl,
           account,
@@ -258,6 +287,7 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
   );
   const groupHistories = new Map<string, HistoryEntry[]>();
   const textLimit = resolveTextChunkLimit(cfg, "signal", accountInfo.accountId);
+  const chunkMode = resolveChunkMode(cfg, "signal", accountInfo.accountId);
   const baseUrl = opts.baseUrl?.trim() || accountInfo.baseUrl;
   const account = opts.account?.trim() || accountInfo.config.account?.trim();
   const dmPolicy = accountInfo.config.dmPolicy ?? "pairing";
@@ -269,13 +299,20 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
         ? accountInfo.config.allowFrom
         : []),
   );
-  const groupPolicy = accountInfo.config.groupPolicy ?? "allowlist";
+  const defaultGroupPolicy = cfg.channels?.defaults?.groupPolicy;
+  const groupPolicy = accountInfo.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
   const reactionMode = accountInfo.config.reactionNotifications ?? "own";
   const reactionAllowlist = normalizeAllowList(accountInfo.config.reactionAllowlist);
   const mediaMaxBytes = (opts.mediaMaxMb ?? accountInfo.config.mediaMaxMb ?? 8) * 1024 * 1024;
   const ignoreAttachments = opts.ignoreAttachments ?? accountInfo.config.ignoreAttachments ?? false;
+  const sendReadReceipts = Boolean(opts.sendReadReceipts ?? accountInfo.config.sendReadReceipts);
 
   const autoStart = opts.autoStart ?? accountInfo.config.autoStart ?? !accountInfo.config.httpUrl;
+  const startupTimeoutMs = Math.min(
+    120_000,
+    Math.max(1_000, opts.startupTimeoutMs ?? accountInfo.config.startupTimeoutMs ?? 30_000),
+  );
+  const readReceiptsViaDaemon = Boolean(autoStart && sendReadReceipts);
   let daemonHandle: ReturnType<typeof spawnSignalDaemon> | null = null;
 
   if (autoStart) {
@@ -290,7 +327,7 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       receiveMode: opts.receiveMode ?? accountInfo.config.receiveMode,
       ignoreAttachments: opts.ignoreAttachments ?? accountInfo.config.ignoreAttachments,
       ignoreStories: opts.ignoreStories ?? accountInfo.config.ignoreStories,
-      sendReadReceipts: opts.sendReadReceipts ?? accountInfo.config.sendReadReceipts,
+      sendReadReceipts,
       runtime,
     });
   }
@@ -305,7 +342,9 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       await waitForSignalDaemonReady({
         baseUrl,
         abortSignal: opts.abortSignal,
-        timeoutMs: 10_000,
+        timeoutMs: startupTimeoutMs,
+        logAfterMs: 10_000,
+        logIntervalMs: 10_000,
         runtime,
       });
     }
@@ -328,8 +367,10 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       reactionAllowlist,
       mediaMaxBytes,
       ignoreAttachments,
+      sendReadReceipts,
+      readReceiptsViaDaemon,
       fetchAttachment,
-      deliverReplies,
+      deliverReplies: (params) => deliverReplies({ ...params, chunkMode }),
       resolveSignalReactionTargets,
       isSignalReactionMessage,
       shouldEmitSignalReactionNotification,
@@ -348,7 +389,9 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       },
     });
   } catch (err) {
-    if (opts.abortSignal?.aborted) return;
+    if (opts.abortSignal?.aborted) {
+      return;
+    }
     throw err;
   } finally {
     opts.abortSignal?.removeEventListener("abort", onAbort);

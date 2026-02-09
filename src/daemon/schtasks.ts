@@ -2,11 +2,11 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-
+import type { GatewayServiceRuntime } from "./service-runtime.js";
 import { colorize, isRich, theme } from "../terminal/theme.js";
 import { formatGatewayServiceDescription, resolveGatewayWindowsTaskName } from "./constants.js";
+import { resolveGatewayStateDir } from "./paths.js";
 import { parseKeyValueOutput } from "./runtime-parse.js";
-import type { GatewayServiceRuntime } from "./service-runtime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,23 +15,44 @@ const formatLine = (label: string, value: string) => {
   return `${colorize(rich, theme.muted, `${label}:`)} ${colorize(rich, theme.command, value)}`;
 };
 
-function resolveHomeDir(env: Record<string, string | undefined>): string {
-  const home = env.USERPROFILE?.trim() || env.HOME?.trim();
-  if (!home) throw new Error("Missing HOME");
-  return home;
+function resolveTaskName(env: Record<string, string | undefined>): string {
+  const override = env.OPENCLAW_WINDOWS_TASK_NAME?.trim();
+  if (override) {
+    return override;
+  }
+  return resolveGatewayWindowsTaskName(env.OPENCLAW_PROFILE);
 }
 
-function resolveTaskScriptPath(env: Record<string, string | undefined>): string {
-  const home = resolveHomeDir(env);
-  const profile = env.CLAWDBOT_PROFILE?.trim();
-  const suffix = profile && profile.toLowerCase() !== "default" ? `-${profile}` : "";
-  return path.join(home, `.clawdbot${suffix}`, "gateway.cmd");
+export function resolveTaskScriptPath(env: Record<string, string | undefined>): string {
+  const override = env.OPENCLAW_TASK_SCRIPT?.trim();
+  if (override) {
+    return override;
+  }
+  const scriptName = env.OPENCLAW_TASK_SCRIPT_NAME?.trim() || "gateway.cmd";
+  const stateDir = resolveGatewayStateDir(env);
+  return path.join(stateDir, scriptName);
 }
-
 
 function quoteCmdArg(value: string): string {
-  if (!/[ \t"]/g.test(value)) return value;
+  if (!/[ \t"]/g.test(value)) {
+    return value;
+  }
   return `"${value.replace(/"/g, '\\"')}"`;
+}
+
+function resolveTaskUser(env: Record<string, string | undefined>): string | null {
+  const username = env.USERNAME || env.USER || env.LOGNAME;
+  if (!username) {
+    return null;
+  }
+  if (username.includes("\\")) {
+    return username;
+  }
+  const domain = env.USERDOMAIN;
+  if (domain) {
+    return `${domain}\\${username}`;
+  }
+  return username;
 }
 
 function parseCommandLine(value: string): string[] {
@@ -63,7 +84,9 @@ function parseCommandLine(value: string): string[] {
     }
     current += char;
   }
-  if (current) args.push(current);
+  if (current) {
+    args.push(current);
+  }
   return args;
 }
 
@@ -80,16 +103,24 @@ export async function readScheduledTaskCommand(env: Record<string, string | unde
     const environment: Record<string, string> = {};
     for (const rawLine of content.split(/\r?\n/)) {
       const line = rawLine.trim();
-      if (!line) continue;
-      if (line.startsWith("@echo")) continue;
-      if (line.toLowerCase().startsWith("rem ")) continue;
+      if (!line) {
+        continue;
+      }
+      if (line.startsWith("@echo")) {
+        continue;
+      }
+      if (line.toLowerCase().startsWith("rem ")) {
+        continue;
+      }
       if (line.toLowerCase().startsWith("set ")) {
         const assignment = line.slice(4).trim();
         const index = assignment.indexOf("=");
         if (index > 0) {
           const key = assignment.slice(0, index).trim();
           const value = assignment.slice(index + 1).trim();
-          if (key) environment[key] = value;
+          if (key) {
+            environment[key] = value;
+          }
         }
         continue;
       }
@@ -100,7 +131,9 @@ export async function readScheduledTaskCommand(env: Record<string, string | unde
       commandLine = line;
       break;
     }
-    if (!commandLine) return null;
+    if (!commandLine) {
+      return null;
+    }
     return {
       programArguments: parseCommandLine(commandLine),
       ...(workingDirectory ? { workingDirectory } : {}),
@@ -121,11 +154,17 @@ export function parseSchtasksQuery(output: string): ScheduledTaskInfo {
   const entries = parseKeyValueOutput(output, ":");
   const info: ScheduledTaskInfo = {};
   const status = entries.status;
-  if (status) info.status = status;
+  if (status) {
+    info.status = status;
+  }
   const lastRunTime = entries["last run time"];
-  if (lastRunTime) info.lastRunTime = lastRunTime;
+  if (lastRunTime) {
+    info.lastRunTime = lastRunTime;
+  }
   const lastRunResult = entries["last run result"];
-  if (lastRunResult) info.lastRunResult = lastRunResult;
+  if (lastRunResult) {
+    info.lastRunResult = lastRunResult;
+  }
   return info;
 }
 
@@ -149,7 +188,9 @@ function buildTaskScript({
   }
   if (environment) {
     for (const [key, value] of Object.entries(environment)) {
-      if (!value) continue;
+      if (!value) {
+        continue;
+      }
       lines.push(`set ${key}=${value}`);
     }
   }
@@ -189,7 +230,9 @@ async function execSchtasks(
 
 async function assertSchtasksAvailable() {
   const res = await execSchtasks(["/Query"]);
-  if (res.code === 0) return;
+  if (res.code === 0) {
+    return;
+  }
   const detail = res.stderr || res.stdout;
   throw new Error(`schtasks unavailable: ${detail || "unknown error"}`.trim());
 }
@@ -200,31 +243,35 @@ export async function installScheduledTask({
   programArguments,
   workingDirectory,
   environment,
+  description,
 }: {
   env: Record<string, string | undefined>;
   stdout: NodeJS.WritableStream;
   programArguments: string[];
   workingDirectory?: string;
   environment?: Record<string, string | undefined>;
+  description?: string;
 }): Promise<{ scriptPath: string }> {
   await assertSchtasksAvailable();
   const scriptPath = resolveTaskScriptPath(env);
   await fs.mkdir(path.dirname(scriptPath), { recursive: true });
-  const description = formatGatewayServiceDescription({
-    profile: env.CLAWDBOT_PROFILE,
-    version: environment?.CLAWDBOT_SERVICE_VERSION ?? env.CLAWDBOT_SERVICE_VERSION,
-  });
+  const taskDescription =
+    description ??
+    formatGatewayServiceDescription({
+      profile: env.OPENCLAW_PROFILE,
+      version: environment?.OPENCLAW_SERVICE_VERSION ?? env.OPENCLAW_SERVICE_VERSION,
+    });
   const script = buildTaskScript({
-    description,
+    description: taskDescription,
     programArguments,
     workingDirectory,
     environment,
   });
   await fs.writeFile(scriptPath, script, "utf8");
 
-  const taskName = resolveGatewayWindowsTaskName(env.CLAWDBOT_PROFILE);
+  const taskName = resolveTaskName(env);
   const quotedScript = quoteCmdArg(scriptPath);
-  const create = await execSchtasks([
+  const baseArgs = [
     "/Create",
     "/F",
     "/SC",
@@ -235,12 +282,25 @@ export async function installScheduledTask({
     taskName,
     "/TR",
     quotedScript,
-  ]);
+  ];
+  const taskUser = resolveTaskUser(env);
+  let create = await execSchtasks(
+    taskUser ? [...baseArgs, "/RU", taskUser, "/NP", "/IT"] : baseArgs,
+  );
+  if (create.code !== 0 && taskUser) {
+    create = await execSchtasks(baseArgs);
+  }
   if (create.code !== 0) {
-    throw new Error(`schtasks create failed: ${create.stderr || create.stdout}`.trim());
+    const detail = create.stderr || create.stdout;
+    const hint = /access is denied/i.test(detail)
+      ? " Run PowerShell as Administrator or rerun without installing the daemon."
+      : "";
+    throw new Error(`schtasks create failed: ${detail}${hint}`.trim());
   }
 
   await execSchtasks(["/Run", "/TN", taskName]);
+  // Ensure we don't end up writing to a clack spinner line (wizards show progress without a newline).
+  stdout.write("\n");
   stdout.write(`${formatLine("Installed Scheduled Task", taskName)}\n`);
   stdout.write(`${formatLine("Task script", scriptPath)}\n`);
   return { scriptPath };
@@ -254,7 +314,7 @@ export async function uninstallScheduledTask({
   stdout: NodeJS.WritableStream;
 }): Promise<void> {
   await assertSchtasksAvailable();
-  const taskName = resolveGatewayWindowsTaskName(env.CLAWDBOT_PROFILE);
+  const taskName = resolveTaskName(env);
   await execSchtasks(["/Delete", "/F", "/TN", taskName]);
 
   const scriptPath = resolveTaskScriptPath(env);
@@ -267,19 +327,19 @@ export async function uninstallScheduledTask({
 }
 
 function isTaskNotRunning(res: { stdout: string; stderr: string; code: number }): boolean {
-  const detail = `${res.stderr || res.stdout}`.toLowerCase();
+  const detail = (res.stderr || res.stdout).toLowerCase();
   return detail.includes("not running");
 }
 
 export async function stopScheduledTask({
   stdout,
-  profile,
+  env,
 }: {
   stdout: NodeJS.WritableStream;
-  profile?: string;
+  env?: Record<string, string | undefined>;
 }): Promise<void> {
   await assertSchtasksAvailable();
-  const taskName = resolveGatewayWindowsTaskName(profile);
+  const taskName = resolveTaskName(env ?? (process.env as Record<string, string | undefined>));
   const res = await execSchtasks(["/End", "/TN", taskName]);
   if (res.code !== 0 && !isTaskNotRunning(res)) {
     throw new Error(`schtasks end failed: ${res.stderr || res.stdout}`.trim());
@@ -289,13 +349,13 @@ export async function stopScheduledTask({
 
 export async function restartScheduledTask({
   stdout,
-  profile,
+  env,
 }: {
   stdout: NodeJS.WritableStream;
-  profile?: string;
+  env?: Record<string, string | undefined>;
 }): Promise<void> {
   await assertSchtasksAvailable();
-  const taskName = resolveGatewayWindowsTaskName(profile);
+  const taskName = resolveTaskName(env ?? (process.env as Record<string, string | undefined>));
   await execSchtasks(["/End", "/TN", taskName]);
   const res = await execSchtasks(["/Run", "/TN", taskName]);
   if (res.code !== 0) {
@@ -304,9 +364,11 @@ export async function restartScheduledTask({
   stdout.write(`${formatLine("Restarted Scheduled Task", taskName)}\n`);
 }
 
-export async function isScheduledTaskInstalled(profile?: string): Promise<boolean> {
+export async function isScheduledTaskInstalled(args: {
+  env?: Record<string, string | undefined>;
+}): Promise<boolean> {
   await assertSchtasksAvailable();
-  const taskName = resolveGatewayWindowsTaskName(profile);
+  const taskName = resolveTaskName(args.env ?? (process.env as Record<string, string | undefined>));
   const res = await execSchtasks(["/Query", "/TN", taskName]);
   return res.code === 0;
 }
@@ -322,7 +384,7 @@ export async function readScheduledTaskRuntime(
       detail: String(err),
     };
   }
-  const taskName = resolveGatewayWindowsTaskName(env.CLAWDBOT_PROFILE);
+  const taskName = resolveTaskName(env);
   const res = await execSchtasks(["/Query", "/TN", taskName, "/V", "/FO", "LIST"]);
   if (res.code !== 0) {
     const detail = (res.stderr || res.stdout).trim();

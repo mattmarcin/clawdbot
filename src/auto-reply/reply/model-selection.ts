@@ -1,3 +1,6 @@
+import type { OpenClawConfig } from "../../config/config.js";
+import type { ThinkLevel } from "./directives.js";
+import { clearSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { loadModelCatalog } from "../../agents/model-catalog.js";
@@ -9,9 +12,9 @@ import {
   resolveModelRefFromString,
   resolveThinkingDefault,
 } from "../../agents/model-selection.js";
-import type { ClawdbotConfig } from "../../config/config.js";
-import { type SessionEntry, saveSessionStore } from "../../config/sessions.js";
-import type { ThinkLevel } from "./directives.js";
+import { type SessionEntry, updateSessionStore } from "../../config/sessions.js";
+import { applyModelOverrideToSessionEntry } from "../../sessions/model-overrides.js";
+import { resolveThreadParentSessionKey } from "../../sessions/session-key-utils.js";
 
 export type ModelDirectiveSelection = {
   provider: string;
@@ -44,6 +47,110 @@ const FUZZY_VARIANT_TOKENS = [
   "nano",
 ];
 
+function boundedLevenshteinDistance(a: string, b: string, maxDistance: number): number | null {
+  if (a === b) {
+    return 0;
+  }
+  if (!a || !b) {
+    return null;
+  }
+  const aLen = a.length;
+  const bLen = b.length;
+  if (Math.abs(aLen - bLen) > maxDistance) {
+    return null;
+  }
+
+  // Standard DP with early exit. O(maxDistance * minLen) in common cases.
+  const prev = Array.from({ length: bLen + 1 }, (_, idx) => idx);
+  const curr = Array.from({ length: bLen + 1 }, () => 0);
+
+  for (let i = 1; i <= aLen; i++) {
+    curr[0] = i;
+    let rowMin = curr[0];
+
+    const aChar = a.charCodeAt(i - 1);
+    for (let j = 1; j <= bLen; j++) {
+      const cost = aChar === b.charCodeAt(j - 1) ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      if (curr[j] < rowMin) {
+        rowMin = curr[j];
+      }
+    }
+
+    if (rowMin > maxDistance) {
+      return null;
+    }
+
+    for (let j = 0; j <= bLen; j++) {
+      prev[j] = curr[j] ?? 0;
+    }
+  }
+
+  const dist = prev[bLen] ?? null;
+  if (dist == null || dist > maxDistance) {
+    return null;
+  }
+  return dist;
+}
+
+export type StoredModelOverride = {
+  provider?: string;
+  model: string;
+  source: "session" | "parent";
+};
+
+function resolveModelOverrideFromEntry(entry?: SessionEntry): {
+  provider?: string;
+  model: string;
+} | null {
+  const model = entry?.modelOverride?.trim();
+  if (!model) {
+    return null;
+  }
+  const provider = entry?.providerOverride?.trim() || undefined;
+  return { provider, model };
+}
+
+function resolveParentSessionKeyCandidate(params: {
+  sessionKey?: string;
+  parentSessionKey?: string;
+}): string | null {
+  const explicit = params.parentSessionKey?.trim();
+  if (explicit && explicit !== params.sessionKey) {
+    return explicit;
+  }
+  const derived = resolveThreadParentSessionKey(params.sessionKey);
+  if (derived && derived !== params.sessionKey) {
+    return derived;
+  }
+  return null;
+}
+
+export function resolveStoredModelOverride(params: {
+  sessionEntry?: SessionEntry;
+  sessionStore?: Record<string, SessionEntry>;
+  sessionKey?: string;
+  parentSessionKey?: string;
+}): StoredModelOverride | null {
+  const direct = resolveModelOverrideFromEntry(params.sessionEntry);
+  if (direct) {
+    return { ...direct, source: "session" };
+  }
+  const parentKey = resolveParentSessionKeyCandidate({
+    sessionKey: params.sessionKey,
+    parentSessionKey: params.parentSessionKey,
+  });
+  if (!parentKey || !params.sessionStore) {
+    return null;
+  }
+  const parentEntry = params.sessionStore[parentKey];
+  const parentOverride = resolveModelOverrideFromEntry(parentEntry);
+  if (!parentOverride) {
+    return null;
+  }
+  return { ...parentOverride, source: "parent" };
+}
+
 function scoreFuzzyMatch(params: {
   provider: string;
   model: string;
@@ -71,11 +178,19 @@ function scoreFuzzyMatch(params: {
     value: string,
     weights: { exact: number; starts: number; includes: number },
   ) => {
-    if (!fragment) return 0;
+    if (!fragment) {
+      return 0;
+    }
     let score = 0;
-    if (value === fragment) score = Math.max(score, weights.exact);
-    if (value.startsWith(fragment)) score = Math.max(score, weights.starts);
-    if (value.includes(fragment)) score = Math.max(score, weights.includes);
+    if (value === fragment) {
+      score = Math.max(score, weights.exact);
+    }
+    if (value.startsWith(fragment)) {
+      score = Math.max(score, weights.starts);
+    }
+    if (value.includes(fragment)) {
+      score = Math.max(score, weights.includes);
+    }
     return score;
   };
 
@@ -91,6 +206,13 @@ function scoreFuzzyMatch(params: {
     starts: 110,
     includes: 80,
   });
+
+  // Best-effort typo tolerance for common near-misses like "claud" vs "claude".
+  // Bounded to keep this cheap across large model sets.
+  const distModel = boundedLevenshteinDistance(fragment, modelLower, 3);
+  if (distModel != null) {
+    score += (3 - distModel) * 70;
+  }
 
   const aliases = params.aliasIndex.byKey.get(key) ?? [];
   for (const alias of aliases) {
@@ -112,13 +234,19 @@ function scoreFuzzyMatch(params: {
   if (fragmentVariants.length === 0 && variantCount > 0) {
     score -= variantCount * 30;
   } else if (fragmentVariants.length > 0) {
-    if (variantMatchCount > 0) score += variantMatchCount * 40;
-    if (variantMatchCount === 0) score -= 20;
+    if (variantMatchCount > 0) {
+      score += variantMatchCount * 40;
+    }
+    if (variantMatchCount === 0) {
+      score -= 20;
+    }
   }
 
   const defaultProvider = normalizeProviderId(params.defaultProvider);
   const isDefault = provider === defaultProvider && model === params.defaultModel;
-  if (isDefault) score += 20;
+  if (isDefault) {
+    score += 20;
+  }
 
   return {
     score,
@@ -131,11 +259,12 @@ function scoreFuzzyMatch(params: {
 }
 
 export async function createModelSelectionState(params: {
-  cfg: ClawdbotConfig;
-  agentCfg: NonNullable<NonNullable<ClawdbotConfig["agents"]>["defaults"]> | undefined;
+  cfg: OpenClawConfig;
+  agentCfg: NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]> | undefined;
   sessionEntry?: SessionEntry;
   sessionStore?: Record<string, SessionEntry>;
   sessionKey?: string;
+  parentSessionKey?: string;
   storePath?: string;
   defaultProvider: string;
   defaultModel: string;
@@ -149,6 +278,7 @@ export async function createModelSelectionState(params: {
     sessionEntry,
     sessionStore,
     sessionKey,
+    parentSessionKey,
     storePath,
     defaultProvider,
     defaultModel,
@@ -158,7 +288,13 @@ export async function createModelSelectionState(params: {
   let model = params.model;
 
   const hasAllowlist = agentCfg?.models && Object.keys(agentCfg.models).length > 0;
-  const hasStoredOverride = Boolean(sessionEntry?.modelOverride || sessionEntry?.providerOverride);
+  const initialStoredOverride = resolveStoredModelOverride({
+    sessionEntry,
+    sessionStore,
+    sessionKey,
+    parentSessionKey,
+  });
+  const hasStoredOverride = Boolean(initialStoredOverride);
   const needsModelCatalog = params.hasModelDirective || hasAllowlist || hasStoredOverride;
 
   let allowedModelKeys = new Set<string>();
@@ -184,26 +320,35 @@ export async function createModelSelectionState(params: {
     if (overrideModel) {
       const key = modelKey(overrideProvider, overrideModel);
       if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
-        delete sessionEntry.providerOverride;
-        delete sessionEntry.modelOverride;
-        sessionEntry.updatedAt = Date.now();
-        sessionStore[sessionKey] = sessionEntry;
-        if (storePath) {
-          await saveSessionStore(storePath, sessionStore);
+        const { updated } = applyModelOverrideToSessionEntry({
+          entry: sessionEntry,
+          selection: { provider: defaultProvider, model: defaultModel, isDefault: true },
+        });
+        if (updated) {
+          sessionStore[sessionKey] = sessionEntry;
+          if (storePath) {
+            await updateSessionStore(storePath, (store) => {
+              store[sessionKey] = sessionEntry;
+            });
+          }
         }
-        resetModelOverride = true;
+        resetModelOverride = updated;
       }
     }
   }
 
-  const storedProviderOverride = sessionEntry?.providerOverride?.trim();
-  const storedModelOverride = sessionEntry?.modelOverride?.trim();
-  if (storedModelOverride) {
-    const candidateProvider = storedProviderOverride || defaultProvider;
-    const key = modelKey(candidateProvider, storedModelOverride);
+  const storedOverride = resolveStoredModelOverride({
+    sessionEntry,
+    sessionStore,
+    sessionKey,
+    parentSessionKey,
+  });
+  if (storedOverride?.model) {
+    const candidateProvider = storedOverride.provider || defaultProvider;
+    const key = modelKey(candidateProvider, storedOverride.model);
     if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
       provider = candidateProvider;
-      model = storedModelOverride;
+      model = storedOverride.model;
     }
   }
 
@@ -213,19 +358,22 @@ export async function createModelSelectionState(params: {
       allowKeychainPrompt: false,
     });
     const profile = store.profiles[sessionEntry.authProfileOverride];
-    if (!profile || profile.provider !== provider) {
-      delete sessionEntry.authProfileOverride;
-      sessionEntry.updatedAt = Date.now();
-      sessionStore[sessionKey] = sessionEntry;
-      if (storePath) {
-        await saveSessionStore(storePath, sessionStore);
-      }
+    const providerKey = normalizeProviderId(provider);
+    if (!profile || normalizeProviderId(profile.provider) !== providerKey) {
+      await clearSessionAuthProfileOverride({
+        sessionEntry,
+        sessionStore,
+        sessionKey,
+        storePath,
+      });
     }
   }
 
   let defaultThinkingLevel: ThinkLevel | undefined;
   const resolveDefaultThinkingLevel = async () => {
-    if (defaultThinkingLevel) return defaultThinkingLevel;
+    if (defaultThinkingLevel) {
+      return defaultThinkingLevel;
+    }
     let catalogForThinking = modelCatalog ?? allowedModelCatalog;
     if (!catalogForThinking || catalogForThinking.length === 0) {
       modelCatalog = await loadModelCatalog({ config: cfg });
@@ -283,26 +431,33 @@ export function resolveModelDirectiveSelection(params: {
     fragment: string;
   }): { selection?: ModelDirectiveSelection; error?: string } => {
     const fragment = params.fragment.trim().toLowerCase();
-    if (!fragment) return {};
+    if (!fragment) {
+      return {};
+    }
+
+    const providerFilter = params.provider ? normalizeProviderId(params.provider) : undefined;
 
     const candidates: Array<{ provider: string; model: string }> = [];
     for (const key of allowedModelKeys) {
       const slash = key.indexOf("/");
-      if (slash <= 0) continue;
+      if (slash <= 0) {
+        continue;
+      }
       const provider = normalizeProviderId(key.slice(0, slash));
       const model = key.slice(slash + 1);
-      if (params.provider && provider !== normalizeProviderId(params.provider)) continue;
-      const haystack = `${provider}/${model}`.toLowerCase();
-      if (haystack.includes(fragment) || model.toLowerCase().includes(fragment)) {
-        candidates.push({ provider, model });
+      if (providerFilter && provider !== providerFilter) {
+        continue;
       }
+      candidates.push({ provider, model });
     }
 
     // Also allow partial alias matches when the user didn't specify a provider.
     if (!params.provider) {
       const aliasMatches: Array<{ provider: string; model: string }> = [];
       for (const [aliasKey, entry] of aliasIndex.byAlias.entries()) {
-        if (!aliasKey.includes(fragment)) continue;
+        if (!aliasKey.includes(fragment)) {
+          continue;
+        }
         aliasMatches.push({
           provider: entry.ref.provider,
           model: entry.ref.model,
@@ -310,19 +465,18 @@ export function resolveModelDirectiveSelection(params: {
       }
       for (const match of aliasMatches) {
         const key = modelKey(match.provider, match.model);
-        if (!allowedModelKeys.has(key)) continue;
+        if (!allowedModelKeys.has(key)) {
+          continue;
+        }
         if (!candidates.some((c) => c.provider === match.provider && c.model === match.model)) {
           candidates.push(match);
         }
       }
     }
 
-    if (candidates.length === 1) {
-      const match = candidates[0];
-      if (!match) return {};
-      return { selection: buildSelection(match.provider, match.model) };
+    if (candidates.length === 0) {
+      return {};
     }
-    if (candidates.length === 0) return {};
 
     const scored = candidates
       .map((candidate) => {
@@ -334,20 +488,38 @@ export function resolveModelDirectiveSelection(params: {
           defaultProvider,
           defaultModel,
         });
-        return { candidate, ...details };
+        return Object.assign({ candidate }, details);
       })
-      .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
-        if (a.variantMatchCount !== b.variantMatchCount)
+      .toSorted((a, b) => {
+        if (b.score !== a.score) {
+          return b.score - a.score;
+        }
+        if (a.isDefault !== b.isDefault) {
+          return a.isDefault ? -1 : 1;
+        }
+        if (a.variantMatchCount !== b.variantMatchCount) {
           return b.variantMatchCount - a.variantMatchCount;
-        if (a.variantCount !== b.variantCount) return a.variantCount - b.variantCount;
-        if (a.modelLength !== b.modelLength) return a.modelLength - b.modelLength;
+        }
+        if (a.variantCount !== b.variantCount) {
+          return a.variantCount - b.variantCount;
+        }
+        if (a.modelLength !== b.modelLength) {
+          return a.modelLength - b.modelLength;
+        }
         return a.key.localeCompare(b.key);
       });
 
-    const best = scored[0]?.candidate;
-    if (!best) return {};
+    const bestScored = scored[0];
+    const best = bestScored?.candidate;
+    if (!best || !bestScored) {
+      return {};
+    }
+
+    const minScore = providerFilter ? 90 : 120;
+    if (bestScored.score < minScore) {
+      return {};
+    }
+
     return { selection: buildSelection(best.provider, best.model) };
   };
 
@@ -359,9 +531,11 @@ export function resolveModelDirectiveSelection(params: {
 
   if (!resolved) {
     const fuzzy = resolveFuzzy({ fragment: rawTrimmed });
-    if (fuzzy.selection || fuzzy.error) return fuzzy;
+    if (fuzzy.selection || fuzzy.error) {
+      return fuzzy;
+    }
     return {
-      error: `Unrecognized model "${rawTrimmed}". Use /model to list available models.`,
+      error: `Unrecognized model "${rawTrimmed}". Use /models to list providers, or /models <provider> to list models.`,
     };
   }
 
@@ -384,20 +558,24 @@ export function resolveModelDirectiveSelection(params: {
     const provider = normalizeProviderId(rawTrimmed.slice(0, slash).trim());
     const fragment = rawTrimmed.slice(slash + 1).trim();
     const fuzzy = resolveFuzzy({ provider, fragment });
-    if (fuzzy.selection || fuzzy.error) return fuzzy;
+    if (fuzzy.selection || fuzzy.error) {
+      return fuzzy;
+    }
   }
 
   // Otherwise, try fuzzy matching across allowlisted models.
   const fuzzy = resolveFuzzy({ fragment: rawTrimmed });
-  if (fuzzy.selection || fuzzy.error) return fuzzy;
+  if (fuzzy.selection || fuzzy.error) {
+    return fuzzy;
+  }
 
   return {
-    error: `Model "${resolved.ref.provider}/${resolved.ref.model}" is not allowed. Use /model to list available models.`,
+    error: `Model "${resolved.ref.provider}/${resolved.ref.model}" is not allowed. Use /models to list providers, or /models <provider> to list models.`,
   };
 }
 
 export function resolveContextTokens(params: {
-  agentCfg: NonNullable<NonNullable<ClawdbotConfig["agents"]>["defaults"]> | undefined;
+  agentCfg: NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]> | undefined;
   model: string;
 }): number {
   return (

@@ -1,6 +1,7 @@
 import chokidar from "chokidar";
+import type { OpenClawConfig, ConfigFileSnapshot, GatewayReloadMode } from "../config/config.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
-import type { ClawdbotConfig, ConfigFileSnapshot, GatewayReloadMode } from "../config/config.js";
+import { getActivePluginRegistry } from "../plugins/runtime.js";
 
 export type GatewayReloadSettings = {
   mode: GatewayReloadMode;
@@ -79,15 +80,22 @@ const BASE_RELOAD_RULES_TAIL: ReloadRule[] = [
   { prefix: "plugins", kind: "restart" },
   { prefix: "ui", kind: "none" },
   { prefix: "gateway", kind: "restart" },
-  { prefix: "bridge", kind: "restart" },
   { prefix: "discovery", kind: "restart" },
   { prefix: "canvasHost", kind: "restart" },
 ];
 
 let cachedReloadRules: ReloadRule[] | null = null;
+let cachedRegistry: ReturnType<typeof getActivePluginRegistry> | null = null;
 
 function listReloadRules(): ReloadRule[] {
-  if (cachedReloadRules) return cachedReloadRules;
+  const registry = getActivePluginRegistry();
+  if (registry !== cachedRegistry) {
+    cachedReloadRules = null;
+    cachedRegistry = registry;
+  }
+  if (cachedReloadRules) {
+    return cachedReloadRules;
+  }
   // Channel docking: plugins contribute hot reload/no-op prefixes here.
   const channelReloadRules: ReloadRule[] = listChannelPlugins().flatMap((plugin) => [
     ...(plugin.reload?.configPrefixes ?? []).map(
@@ -111,7 +119,9 @@ function listReloadRules(): ReloadRule[] {
 
 function matchRule(path: string): ReloadRule | null {
   for (const rule of listReloadRules()) {
-    if (path === rule.prefix || path.startsWith(`${rule.prefix}.`)) return rule;
+    if (path === rule.prefix || path.startsWith(`${rule.prefix}.`)) {
+      return rule;
+    }
   }
   return null;
 }
@@ -126,14 +136,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 export function diffConfigPaths(prev: unknown, next: unknown, prefix = ""): string[] {
-  if (prev === next) return [];
+  if (prev === next) {
+    return [];
+  }
   if (isPlainObject(prev) && isPlainObject(next)) {
     const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
     const paths: string[] = [];
     for (const key of keys) {
       const prevValue = prev[key];
       const nextValue = next[key];
-      if (prevValue === undefined && nextValue === undefined) continue;
+      if (prevValue === undefined && nextValue === undefined) {
+        continue;
+      }
       const childPrefix = prefix ? `${prefix}.${key}` : key;
       const childPaths = diffConfigPaths(prevValue, nextValue, childPrefix);
       if (childPaths.length > 0) {
@@ -150,7 +164,7 @@ export function diffConfigPaths(prev: unknown, next: unknown, prefix = ""): stri
   return [prefix || "<root>"];
 }
 
-export function resolveGatewayReloadSettings(cfg: ClawdbotConfig): GatewayReloadSettings {
+export function resolveGatewayReloadSettings(cfg: OpenClawConfig): GatewayReloadSettings {
   const rawMode = cfg.gateway?.reload?.mode;
   const mode =
     rawMode === "off" || rawMode === "restart" || rawMode === "hot" || rawMode === "hybrid"
@@ -240,10 +254,10 @@ export type GatewayConfigReloader = {
 };
 
 export function startGatewayConfigReloader(opts: {
-  initialConfig: ClawdbotConfig;
+  initialConfig: OpenClawConfig;
   readSnapshot: () => Promise<ConfigFileSnapshot>;
-  onHotReload: (plan: GatewayReloadPlan, nextConfig: ClawdbotConfig) => Promise<void>;
-  onRestart: (plan: GatewayReloadPlan, nextConfig: ClawdbotConfig) => void;
+  onHotReload: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => Promise<void>;
+  onRestart: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => void;
   log: {
     info: (msg: string) => void;
     warn: (msg: string) => void;
@@ -260,8 +274,12 @@ export function startGatewayConfigReloader(opts: {
   let restartQueued = false;
 
   const schedule = () => {
-    if (stopped) return;
-    if (debounceTimer) clearTimeout(debounceTimer);
+    if (stopped) {
+      return;
+    }
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
     const wait = settings.debounceMs;
     debounceTimer = setTimeout(() => {
       void runReload();
@@ -269,7 +287,9 @@ export function startGatewayConfigReloader(opts: {
   };
 
   const runReload = async () => {
-    if (stopped) return;
+    if (stopped) {
+      return;
+    }
     if (running) {
       pending = true;
       return;
@@ -290,7 +310,9 @@ export function startGatewayConfigReloader(opts: {
       const changedPaths = diffConfigPaths(currentConfig, nextConfig);
       currentConfig = nextConfig;
       settings = resolveGatewayReloadSettings(nextConfig);
-      if (changedPaths.length === 0) return;
+      if (changedPaths.length === 0) {
+        return;
+      }
 
       opts.log.info(`config change detected; evaluating reload (${changedPaths.join(", ")})`);
       const plan = buildGatewayReloadPlan(changedPaths);
@@ -344,7 +366,9 @@ export function startGatewayConfigReloader(opts: {
   watcher.on("unlink", schedule);
   let watcherClosed = false;
   watcher.on("error", (err) => {
-    if (watcherClosed) return;
+    if (watcherClosed) {
+      return;
+    }
     watcherClosed = true;
     opts.log.warn(`config watcher error: ${String(err)}`);
     void watcher.close().catch(() => {});
@@ -353,7 +377,9 @@ export function startGatewayConfigReloader(opts: {
   return {
     stop: async () => {
       stopped = true;
-      if (debounceTimer) clearTimeout(debounceTimer);
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+      }
       debounceTimer = null;
       watcherClosed = true;
       await watcher.close().catch(() => {});

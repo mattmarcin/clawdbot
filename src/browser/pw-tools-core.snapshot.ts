@@ -1,12 +1,17 @@
-import type { Page } from "playwright-core";
-
 import { type AriaSnapshotNode, formatAriaSnapshot, type RawAXNode } from "./cdp.js";
 import {
+  buildRoleSnapshotFromAiSnapshot,
   buildRoleSnapshotFromAriaSnapshot,
   getRoleSnapshotStats,
   type RoleSnapshotOptions,
+  type RoleRefMap,
 } from "./pw-role-snapshot.js";
-import { ensurePageState, getPageForTargetId, type WithSnapshotForAI } from "./pw-session.js";
+import {
+  ensurePageState,
+  getPageForTargetId,
+  storeRoleRefsForTarget,
+  type WithSnapshotForAI,
+} from "./pw-session.js";
 
 export async function snapshotAriaViaPlaywright(opts: {
   cdpUrl: string;
@@ -37,7 +42,7 @@ export async function snapshotAiViaPlaywright(opts: {
   targetId?: string;
   timeoutMs?: number;
   maxChars?: number;
-}): Promise<{ snapshot: string; truncated?: boolean }> {
+}): Promise<{ snapshot: string; truncated?: boolean; refs: RoleRefMap }> {
   const page = await getPageForTargetId({
     cdpUrl: opts.cdpUrl,
     targetId: opts.targetId,
@@ -59,11 +64,21 @@ export async function snapshotAiViaPlaywright(opts: {
     typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars > 0
       ? Math.floor(maxChars)
       : undefined;
+  let truncated = false;
   if (limit && snapshot.length > limit) {
     snapshot = `${snapshot.slice(0, limit)}\n\n[...TRUNCATED - page too large]`;
-    return { snapshot, truncated: true };
+    truncated = true;
   }
-  return { snapshot };
+
+  const built = buildRoleSnapshotFromAiSnapshot(snapshot);
+  storeRoleRefsForTarget({
+    page,
+    cdpUrl: opts.cdpUrl,
+    targetId: opts.targetId,
+    refs: built.refs,
+    mode: "aria",
+  });
+  return truncated ? { snapshot, truncated, refs: built.refs } : { snapshot, refs: built.refs };
 }
 
 export async function snapshotRoleViaPlaywright(opts: {
@@ -71,6 +86,7 @@ export async function snapshotRoleViaPlaywright(opts: {
   targetId?: string;
   selector?: string;
   frameSelector?: string;
+  refsMode?: "role" | "aria";
   options?: RoleSnapshotOptions;
 }): Promise<{
   snapshot: string;
@@ -81,7 +97,34 @@ export async function snapshotRoleViaPlaywright(opts: {
     cdpUrl: opts.cdpUrl,
     targetId: opts.targetId,
   });
-  const state = ensurePageState(page);
+  ensurePageState(page);
+
+  if (opts.refsMode === "aria") {
+    if (opts.selector?.trim() || opts.frameSelector?.trim()) {
+      throw new Error("refs=aria does not support selector/frame snapshots yet.");
+    }
+    const maybe = page as unknown as WithSnapshotForAI;
+    if (!maybe._snapshotForAI) {
+      throw new Error("refs=aria requires Playwright _snapshotForAI support.");
+    }
+    const result = await maybe._snapshotForAI({
+      timeout: 5000,
+      track: "response",
+    });
+    const built = buildRoleSnapshotFromAiSnapshot(String(result?.full ?? ""), opts.options);
+    storeRoleRefsForTarget({
+      page,
+      cdpUrl: opts.cdpUrl,
+      targetId: opts.targetId,
+      refs: built.refs,
+      mode: "aria",
+    });
+    return {
+      snapshot: built.snapshot,
+      refs: built.refs,
+      stats: getRoleSnapshotStats(built.snapshot, built.refs),
+    };
+  }
 
   const frameSelector = opts.frameSelector?.trim() || "";
   const selector = opts.selector?.trim() || "";
@@ -95,8 +138,14 @@ export async function snapshotRoleViaPlaywright(opts: {
 
   const ariaSnapshot = await locator.ariaSnapshot();
   const built = buildRoleSnapshotFromAriaSnapshot(String(ariaSnapshot ?? ""), opts.options);
-  state.roleRefs = built.refs;
-  state.roleRefsFrameSelector = frameSelector || undefined;
+  storeRoleRefsForTarget({
+    page,
+    cdpUrl: opts.cdpUrl,
+    targetId: opts.targetId,
+    refs: built.refs,
+    frameSelector: frameSelector || undefined,
+    mode: "role",
+  });
   return {
     snapshot: built.snapshot,
     refs: built.refs,
@@ -111,7 +160,9 @@ export async function navigateViaPlaywright(opts: {
   timeoutMs?: number;
 }): Promise<{ url: string }> {
   const url = String(opts.url ?? "").trim();
-  if (!url) throw new Error("url is required");
+  if (!url) {
+    throw new Error("url is required");
+  }
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
   await page.goto(url, {
@@ -149,6 +200,6 @@ export async function pdfViaPlaywright(opts: {
 }): Promise<{ buffer: Buffer }> {
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
-  const buffer = await (page as Page).pdf({ printBackground: true });
+  const buffer = await page.pdf({ printBackground: true });
   return { buffer };
 }

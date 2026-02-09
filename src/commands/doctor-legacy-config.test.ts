@@ -2,7 +2,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
 import { normalizeLegacyConfigValues } from "./doctor-legacy-config.js";
 
 describe("normalizeLegacyConfigValues", () => {
@@ -15,16 +14,16 @@ describe("normalizeLegacyConfigValues", () => {
   };
 
   beforeEach(() => {
-    previousOauthDir = process.env.CLAWDBOT_OAUTH_DIR;
-    tempOauthDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-oauth-"));
-    process.env.CLAWDBOT_OAUTH_DIR = tempOauthDir;
+    previousOauthDir = process.env.OPENCLAW_OAUTH_DIR;
+    tempOauthDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-oauth-"));
+    process.env.OPENCLAW_OAUTH_DIR = tempOauthDir;
   });
 
   afterEach(() => {
     if (previousOauthDir === undefined) {
-      delete process.env.CLAWDBOT_OAUTH_DIR;
+      delete process.env.OPENCLAW_OAUTH_DIR;
     } else {
-      process.env.CLAWDBOT_OAUTH_DIR = previousOauthDir;
+      process.env.OPENCLAW_OAUTH_DIR = previousOauthDir;
     }
     if (tempOauthDir) {
       fs.rmSync(tempOauthDir, { recursive: true, force: true });
@@ -57,7 +56,7 @@ describe("normalizeLegacyConfigValues", () => {
     ]);
   });
 
-  it("copies legacy ack reaction when whatsapp auth exists", () => {
+  it("does not add whatsapp config when only auth exists (issue #900)", () => {
     const credsDir = path.join(tempOauthDir ?? "", "whatsapp", "default");
     writeCreds(credsDir);
 
@@ -65,14 +64,11 @@ describe("normalizeLegacyConfigValues", () => {
       messages: { ackReaction: "👀", ackReactionScope: "group-mentions" },
     });
 
-    expect(res.config.channels?.whatsapp?.ackReaction).toEqual({
-      emoji: "👀",
-      direct: false,
-      group: "mentions",
-    });
+    expect(res.config.channels?.whatsapp).toBeUndefined();
+    expect(res.changes).toEqual([]);
   });
 
-  it("copies legacy ack reaction when legacy auth exists", () => {
+  it("does not add whatsapp config when only legacy auth exists (issue #900)", () => {
     const credsPath = path.join(tempOauthDir ?? "", "creds.json");
     fs.writeFileSync(credsPath, JSON.stringify({ me: {} }));
 
@@ -80,14 +76,11 @@ describe("normalizeLegacyConfigValues", () => {
       messages: { ackReaction: "👀", ackReactionScope: "group-mentions" },
     });
 
-    expect(res.config.channels?.whatsapp?.ackReaction).toEqual({
-      emoji: "👀",
-      direct: false,
-      group: "mentions",
-    });
+    expect(res.config.channels?.whatsapp).toBeUndefined();
+    expect(res.changes).toEqual([]);
   });
 
-  it("copies legacy ack reaction when non-default auth exists", () => {
+  it("does not add whatsapp config when only non-default auth exists (issue #900)", () => {
     const credsDir = path.join(tempOauthDir ?? "", "whatsapp", "work");
     writeCreds(credsDir);
 
@@ -95,15 +88,12 @@ describe("normalizeLegacyConfigValues", () => {
       messages: { ackReaction: "👀", ackReactionScope: "group-mentions" },
     });
 
-    expect(res.config.channels?.whatsapp?.ackReaction).toEqual({
-      emoji: "👀",
-      direct: false,
-      group: "mentions",
-    });
+    expect(res.config.channels?.whatsapp).toBeUndefined();
+    expect(res.changes).toEqual([]);
   });
 
   it("copies legacy ack reaction when authDir override exists", () => {
-    const customDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-wa-auth-"));
+    const customDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-wa-auth-"));
     try {
       writeCreds(customDir);
 

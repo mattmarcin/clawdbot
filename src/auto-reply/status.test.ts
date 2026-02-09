@@ -1,10 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/config.js";
 import { normalizeTestText } from "../../test/helpers/normalize-text.js";
 import { withTempHome } from "../../test/helpers/temp-home.js";
-import type { ClawdbotConfig } from "../config/config.js";
-import { buildCommandsMessage, buildHelpMessage, buildStatusMessage } from "./status.js";
+import {
+  buildCommandsMessage,
+  buildCommandsMessagePaginated,
+  buildHelpMessage,
+  buildStatusMessage,
+} from "./status.js";
+
+const { listPluginCommands } = vi.hoisted(() => ({
+  listPluginCommands: vi.fn(() => []),
+}));
+
+vi.mock("../plugins/commands.js", () => ({
+  listPluginCommands,
+}));
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -32,7 +45,7 @@ describe("buildStatusMessage", () => {
             },
           },
         },
-      } as ClawdbotConfig,
+      } as OpenClawConfig,
       agent: {
         model: "anthropic/pi:opus",
         contextTokens: 32_000,
@@ -58,7 +71,7 @@ describe("buildStatusMessage", () => {
     });
     const normalized = normalizeTestText(text);
 
-    expect(normalized).toContain("Clawdbot");
+    expect(normalized).toContain("OpenClaw");
     expect(normalized).toContain("Model: anthropic/pi:opus");
     expect(normalized).toContain("api-key");
     expect(normalized).toContain("Tokens: 1.2k in / 800 out");
@@ -72,6 +85,25 @@ describe("buildStatusMessage", () => {
     expect(normalized).not.toContain("verbose");
     expect(normalized).toContain("elevated");
     expect(normalized).toContain("Queue: collect");
+  });
+
+  it("uses per-agent sandbox config when config and session key are provided", () => {
+    const text = buildStatusMessage({
+      config: {
+        agents: {
+          list: [
+            { id: "main", default: true },
+            { id: "discord", sandbox: { mode: "all" } },
+          ],
+        },
+      } as OpenClawConfig,
+      agent: {},
+      sessionKey: "agent:discord:discord:channel:1456350065223270435",
+      sessionScope: "per-sender",
+      queue: { mode: "collect", depth: 0 },
+    });
+
+    expect(normalizeTestText(text)).toContain("Runtime: docker/all");
   });
 
   it("shows verbose/elevated labels only when enabled", () => {
@@ -88,6 +120,75 @@ describe("buildStatusMessage", () => {
 
     expect(text).toContain("verbose");
     expect(text).toContain("elevated");
+  });
+
+  it("includes media understanding decisions when present", () => {
+    const text = buildStatusMessage({
+      agent: { model: "anthropic/claude-opus-4-5" },
+      sessionEntry: { sessionId: "media", updatedAt: 0 },
+      sessionKey: "agent:main:main",
+      queue: { mode: "none" },
+      mediaDecisions: [
+        {
+          capability: "image",
+          outcome: "success",
+          attachments: [
+            {
+              attachmentIndex: 0,
+              attempts: [
+                {
+                  type: "provider",
+                  outcome: "success",
+                  provider: "openai",
+                  model: "gpt-5.2",
+                },
+              ],
+              chosen: {
+                type: "provider",
+                outcome: "success",
+                provider: "openai",
+                model: "gpt-5.2",
+              },
+            },
+          ],
+        },
+        {
+          capability: "audio",
+          outcome: "skipped",
+          attachments: [
+            {
+              attachmentIndex: 1,
+              attempts: [
+                {
+                  type: "provider",
+                  outcome: "skipped",
+                  reason: "maxBytes: too large",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const normalized = normalizeTestText(text);
+    expect(normalized).toContain("Media: image ok (openai/gpt-5.2) · audio skipped (maxBytes)");
+  });
+
+  it("omits media line when all decisions are none", () => {
+    const text = buildStatusMessage({
+      agent: { model: "anthropic/claude-opus-4-5" },
+      sessionEntry: { sessionId: "media-none", updatedAt: 0 },
+      sessionKey: "agent:main:main",
+      queue: { mode: "none" },
+      mediaDecisions: [
+        { capability: "image", outcome: "no-attachment", attachments: [] },
+        { capability: "audio", outcome: "no-attachment", attachments: [] },
+        { capability: "video", outcome: "no-attachment", attachments: [] },
+      ],
+    });
+
+    expect(normalizeTestText(text)).not.toContain("Media:");
   });
 
   it("does not show elevated label when session explicitly disables it", () => {
@@ -232,7 +333,7 @@ describe("buildStatusMessage", () => {
             },
           },
         },
-      } as ClawdbotConfig,
+      } as OpenClawConfig,
       agent: { model: "anthropic/claude-opus-4-5" },
       sessionEntry: { sessionId: "c1", updatedAt: 0, inputTokens: 10 },
       sessionKey: "agent:main:main",
@@ -253,7 +354,7 @@ describe("buildStatusMessage", () => {
         const sessionId = "sess-1";
         const logPath = path.join(
           dir,
-          ".clawdbot",
+          ".openclaw",
           "agents",
           "main",
           "sessions",
@@ -302,7 +403,7 @@ describe("buildStatusMessage", () => {
 
         expect(normalizeTestText(text)).toContain("Context: 1.0k/32k");
       },
-      { prefix: "clawdbot-status-" },
+      { prefix: "openclaw-status-" },
     );
   });
 });
@@ -311,12 +412,31 @@ describe("buildCommandsMessage", () => {
   it("lists commands with aliases and text-only hints", () => {
     const text = buildCommandsMessage({
       commands: { config: false, debug: false },
-    } as ClawdbotConfig);
+    } as OpenClawConfig);
+    expect(text).toContain("ℹ️ Slash commands");
+    expect(text).toContain("Status");
     expect(text).toContain("/commands - List all slash commands.");
-    expect(text).toContain("/think (aliases: /thinking, /t) - Set thinking level.");
-    expect(text).toContain("/compact (text-only) - Compact the session context.");
+    expect(text).toContain("/skill - Run a skill by name.");
+    expect(text).toContain("/think (/thinking, /t) - Set thinking level.");
+    expect(text).toContain("/compact [text] - Compact the session context.");
     expect(text).not.toContain("/config");
     expect(text).not.toContain("/debug");
+  });
+
+  it("includes skill commands when provided", () => {
+    const text = buildCommandsMessage(
+      {
+        commands: { config: false, debug: false },
+      } as OpenClawConfig,
+      [
+        {
+          name: "demo_skill",
+          skillName: "demo-skill",
+          description: "Demo skill",
+        },
+      ],
+    );
+    expect(text).toContain("/demo_skill - Demo skill");
   });
 });
 
@@ -324,8 +444,40 @@ describe("buildHelpMessage", () => {
   it("hides config/debug when disabled", () => {
     const text = buildHelpMessage({
       commands: { config: false, debug: false },
-    } as ClawdbotConfig);
+    } as OpenClawConfig);
+    expect(text).toContain("Skills");
+    expect(text).toContain("/skill <name> [input]");
     expect(text).not.toContain("/config");
     expect(text).not.toContain("/debug");
+  });
+});
+
+describe("buildCommandsMessagePaginated", () => {
+  it("formats telegram output with pages", () => {
+    const result = buildCommandsMessagePaginated(
+      {
+        commands: { config: false, debug: false },
+      } as OpenClawConfig,
+      undefined,
+      { surface: "telegram", page: 1 },
+    );
+    expect(result.text).toContain("ℹ️ Commands (1/");
+    expect(result.text).toContain("Session");
+    expect(result.text).toContain("/stop - Stop the current run.");
+  });
+
+  it("includes plugin commands in the paginated list", () => {
+    listPluginCommands.mockReturnValue([
+      { name: "plugin_cmd", description: "Plugin command", pluginId: "demo-plugin" },
+    ]);
+    const result = buildCommandsMessagePaginated(
+      {
+        commands: { config: false, debug: false },
+      } as OpenClawConfig,
+      undefined,
+      { surface: "telegram", page: 99 },
+    );
+    expect(result.text).toContain("Plugins");
+    expect(result.text).toContain("/plugin_cmd (demo-plugin) - Plugin command");
   });
 });

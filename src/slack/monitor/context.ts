@@ -1,20 +1,55 @@
 import type { App } from "@slack/bolt";
 import type { HistoryEntry } from "../../auto-reply/reply/history.js";
-import type { ClawdbotConfig, SlackReactionNotificationMode } from "../../config/config.js";
-import { resolveSessionKey, type SessionScope } from "../../config/sessions.js";
+import type { OpenClawConfig, SlackReactionNotificationMode } from "../../config/config.js";
 import type { DmPolicy, GroupPolicy } from "../../config/types.js";
+import type { RuntimeEnv } from "../../runtime.js";
+import type { SlackMessageEvent } from "../types.js";
+import { formatAllowlistMatchMeta } from "../../channels/allowlist-match.js";
+import { resolveSessionKey, type SessionScope } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { createDedupeCache } from "../../infra/dedupe.js";
 import { getChildLogger } from "../../logging.js";
-import type { RuntimeEnv } from "../../runtime.js";
-import type { SlackMessageEvent } from "../types.js";
-
 import { normalizeAllowList, normalizeAllowListLower, normalizeSlackSlug } from "./allow-list.js";
 import { resolveSlackChannelConfig } from "./channel-config.js";
-import { isSlackRoomAllowedByPolicy } from "./policy.js";
+import { isSlackChannelAllowedByPolicy } from "./policy.js";
+
+export function inferSlackChannelType(
+  channelId?: string | null,
+): SlackMessageEvent["channel_type"] | undefined {
+  const trimmed = channelId?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.startsWith("D")) {
+    return "im";
+  }
+  if (trimmed.startsWith("C")) {
+    return "channel";
+  }
+  if (trimmed.startsWith("G")) {
+    return "group";
+  }
+  return undefined;
+}
+
+export function normalizeSlackChannelType(
+  channelType?: string | null,
+  channelId?: string | null,
+): SlackMessageEvent["channel_type"] {
+  const normalized = channelType?.trim().toLowerCase();
+  if (
+    normalized === "im" ||
+    normalized === "mpim" ||
+    normalized === "channel" ||
+    normalized === "group"
+  ) {
+    return normalized;
+  }
+  return inferSlackChannelType(channelId) ?? "channel";
+}
 
 export type SlackMonitorContext = {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   accountId: string;
   botToken: string;
   app: App;
@@ -52,6 +87,8 @@ export type SlackMonitorContext = {
   reactionMode: SlackReactionNotificationMode;
   reactionAllowlist: Array<string | number>;
   replyToMode: "off" | "first" | "all";
+  threadHistoryScope: "thread" | "channel";
+  threadInheritParent: boolean;
   slashCommand: Required<import("../../config/config.js").SlackSlashCommandConfig>;
   textLimit: number;
   ackReactionScope: string;
@@ -85,7 +122,7 @@ export type SlackMonitorContext = {
 };
 
 export function createSlackMonitorContext(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   accountId: string;
   botToken: string;
   app: App;
@@ -111,6 +148,8 @@ export function createSlackMonitorContext(params: {
   reactionMode: SlackReactionNotificationMode;
   reactionAllowlist: Array<string | number>;
   replyToMode: SlackMonitorContext["replyToMode"];
+  threadHistoryScope: SlackMonitorContext["threadHistoryScope"];
+  threadInheritParent: SlackMonitorContext["threadInheritParent"];
   slashCommand: SlackMonitorContext["slashCommand"];
   textLimit: number;
   ackReactionScope: string;
@@ -137,7 +176,9 @@ export function createSlackMonitorContext(params: {
   const defaultRequireMention = params.defaultRequireMention ?? true;
 
   const markMessageSeen = (channelId: string | undefined, ts?: string) => {
-    if (!channelId || !ts) return false;
+    if (!channelId || !ts) {
+      return false;
+    }
     return seenMessages.check(`${channelId}:${ts}`);
   };
 
@@ -146,16 +187,18 @@ export function createSlackMonitorContext(params: {
     channelType?: string | null;
   }) => {
     const channelId = p.channelId?.trim() ?? "";
-    if (!channelId) return params.mainKey;
-    const channelType = p.channelType?.trim().toLowerCase() ?? "";
-    const isRoom = channelType === "channel" || channelType === "group";
+    if (!channelId) {
+      return params.mainKey;
+    }
+    const channelType = normalizeSlackChannelType(p.channelType, channelId);
+    const isDirectMessage = channelType === "im";
     const isGroup = channelType === "mpim";
-    const from = isRoom
-      ? `slack:channel:${channelId}`
+    const from = isDirectMessage
+      ? `slack:${channelId}`
       : isGroup
         ? `slack:group:${channelId}`
-        : `slack:${channelId}`;
-    const chatType = isRoom ? "room" : isGroup ? "group" : "direct";
+        : `slack:channel:${channelId}`;
+    const chatType = isDirectMessage ? "direct" : isGroup ? "group" : "channel";
     return resolveSessionKey(
       params.sessionScope,
       { From: from, ChatType: chatType, Provider: "slack" },
@@ -165,7 +208,9 @@ export function createSlackMonitorContext(params: {
 
   const resolveChannelName = async (channelId: string) => {
     const cached = channelCache.get(channelId);
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
     try {
       const info = await params.app.client.conversations.info({
         token: params.botToken,
@@ -195,7 +240,9 @@ export function createSlackMonitorContext(params: {
 
   const resolveUserName = async (userId: string) => {
     const cached = userCache.get(userId);
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
     try {
       const info = await params.app.client.users.info({
         token: params.botToken,
@@ -216,7 +263,9 @@ export function createSlackMonitorContext(params: {
     threadTs?: string;
     status: string;
   }) => {
-    if (!p.threadTs) return;
+    if (!p.threadTs) {
+      return;
+    }
     const payload = {
       token: params.botToken,
       channel_id: p.channelId,
@@ -249,13 +298,17 @@ export function createSlackMonitorContext(params: {
     channelName?: string;
     channelType?: SlackMessageEvent["channel_type"];
   }) => {
-    const channelType = p.channelType;
+    const channelType = normalizeSlackChannelType(p.channelType, p.channelId);
     const isDirectMessage = channelType === "im";
     const isGroupDm = channelType === "mpim";
     const isRoom = channelType === "channel" || channelType === "group";
 
-    if (isDirectMessage && !params.dmEnabled) return false;
-    if (isGroupDm && !params.groupDmEnabled) return false;
+    if (isDirectMessage && !params.dmEnabled) {
+      return false;
+    }
+    if (isGroupDm && !params.groupDmEnabled) {
+      return false;
+    }
 
     if (isGroupDm && groupDmChannels.length > 0) {
       const allowList = normalizeAllowListLower(groupDmChannels);
@@ -269,7 +322,9 @@ export function createSlackMonitorContext(params: {
         .map((value) => value.toLowerCase());
       const permitted =
         allowList.includes("*") || candidates.some((candidate) => allowList.includes(candidate));
-      if (!permitted) return false;
+      if (!permitted) {
+        return false;
+      }
     }
 
     if (isRoom && p.channelId) {
@@ -279,26 +334,40 @@ export function createSlackMonitorContext(params: {
         channels: params.channelsConfig,
         defaultRequireMention,
       });
+      const channelMatchMeta = formatAllowlistMatchMeta(channelConfig);
       const channelAllowed = channelConfig?.allowed !== false;
       const channelAllowlistConfigured =
         Boolean(params.channelsConfig) && Object.keys(params.channelsConfig ?? {}).length > 0;
       if (
-        !isSlackRoomAllowedByPolicy({
+        !isSlackChannelAllowedByPolicy({
           groupPolicy: params.groupPolicy,
           channelAllowlistConfigured,
           channelAllowed,
         })
       ) {
+        logVerbose(
+          `slack: drop channel ${p.channelId} (groupPolicy=${params.groupPolicy}, ${channelMatchMeta})`,
+        );
         return false;
       }
-      if (!channelAllowed) return false;
+      // When groupPolicy is "open", only block channels that are EXPLICITLY denied
+      // (i.e., have a matching config entry with allow:false). Channels not in the
+      // config (matchSource undefined) should be allowed under open policy.
+      const hasExplicitConfig = Boolean(channelConfig?.matchSource);
+      if (!channelAllowed && (params.groupPolicy !== "open" || hasExplicitConfig)) {
+        logVerbose(`slack: drop channel ${p.channelId} (${channelMatchMeta})`);
+        return false;
+      }
+      logVerbose(`slack: allow channel ${p.channelId} (${channelMatchMeta})`);
     }
 
     return true;
   };
 
   const shouldDropMismatchedSlackEvent = (body: unknown) => {
-    if (!body || typeof body !== "object") return false;
+    if (!body || typeof body !== "object") {
+      return false;
+    }
     const raw = body as { api_app_id?: unknown; team_id?: unknown };
     const incomingApiAppId = typeof raw.api_app_id === "string" ? raw.api_app_id : "";
     const incomingTeamId = typeof raw.team_id === "string" ? raw.team_id : "";
@@ -341,6 +410,8 @@ export function createSlackMonitorContext(params: {
     reactionMode: params.reactionMode,
     reactionAllowlist: params.reactionAllowlist,
     replyToMode: params.replyToMode,
+    threadHistoryScope: params.threadHistoryScope,
+    threadInheritParent: params.threadInheritParent,
     slashCommand: params.slashCommand,
     textLimit: params.textLimit,
     ackReactionScope: params.ackReactionScope,

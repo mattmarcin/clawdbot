@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
-import * as sessions from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import type { TemplateContext } from "../templating.js";
 import type { GetReplyOptions } from "../types.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
+import * as sessions from "../../config/sessions.js";
 import { createMockTypingController } from "./test-helpers.js";
 
 const runEmbeddedPiAgentMock = vi.fn();
@@ -122,9 +122,9 @@ function createMinimalRun(params?: {
 
 describe("runReplyAgent typing (heartbeat)", () => {
   it("resets corrupted Gemini sessions and deletes transcripts", async () => {
-    const prevStateDir = process.env.CLAWDBOT_STATE_DIR;
-    const stateDir = await fs.mkdtemp(path.join(tmpdir(), "clawdbot-session-reset-"));
-    process.env.CLAWDBOT_STATE_DIR = stateDir;
+    const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+    const stateDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-session-reset-"));
+    process.env.OPENCLAW_STATE_DIR = stateDir;
     try {
       const sessionId = "session-corrupt";
       const storePath = path.join(stateDir, "sessions", "sessions.json");
@@ -162,16 +162,16 @@ describe("runReplyAgent typing (heartbeat)", () => {
       expect(persisted.main).toBeUndefined();
     } finally {
       if (prevStateDir) {
-        process.env.CLAWDBOT_STATE_DIR = prevStateDir;
+        process.env.OPENCLAW_STATE_DIR = prevStateDir;
       } else {
-        delete process.env.CLAWDBOT_STATE_DIR;
+        delete process.env.OPENCLAW_STATE_DIR;
       }
     }
   });
   it("keeps sessions intact on other errors", async () => {
-    const prevStateDir = process.env.CLAWDBOT_STATE_DIR;
-    const stateDir = await fs.mkdtemp(path.join(tmpdir(), "clawdbot-session-noreset-"));
-    process.env.CLAWDBOT_STATE_DIR = stateDir;
+    const prevStateDir = process.env.OPENCLAW_STATE_DIR;
+    const stateDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-session-noreset-"));
+    process.env.OPENCLAW_STATE_DIR = stateDir;
     try {
       const sessionId = "session-ok";
       const storePath = path.join(stateDir, "sessions", "sessions.json");
@@ -207,10 +207,37 @@ describe("runReplyAgent typing (heartbeat)", () => {
       expect(persisted.main).toBeDefined();
     } finally {
       if (prevStateDir) {
-        process.env.CLAWDBOT_STATE_DIR = prevStateDir;
+        process.env.OPENCLAW_STATE_DIR = prevStateDir;
       } else {
-        delete process.env.CLAWDBOT_STATE_DIR;
+        delete process.env.OPENCLAW_STATE_DIR;
       }
     }
+  });
+  it("returns friendly message for role ordering errors thrown as exceptions", async () => {
+    runEmbeddedPiAgentMock.mockImplementationOnce(async () => {
+      throw new Error("400 Incorrect role information");
+    });
+
+    const { run } = createMinimalRun({});
+    const res = await run();
+
+    expect(res).toMatchObject({
+      text: expect.stringContaining("Message ordering conflict"),
+    });
+    expect(res).toMatchObject({
+      text: expect.not.stringContaining("400"),
+    });
+  });
+  it("returns friendly message for 'roles must alternate' errors thrown as exceptions", async () => {
+    runEmbeddedPiAgentMock.mockImplementationOnce(async () => {
+      throw new Error('messages: roles must alternate between "user" and "assistant"');
+    });
+
+    const { run } = createMinimalRun({});
+    const res = await run();
+
+    expect(res).toMatchObject({
+      text: expect.stringContaining("Message ordering conflict"),
+    });
   });
 });

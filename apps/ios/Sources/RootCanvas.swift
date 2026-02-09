@@ -9,9 +9,15 @@ struct RootCanvas: View {
     @AppStorage(VoiceWakePreferences.enabledKey) private var voiceWakeEnabled: Bool = false
     @AppStorage("screen.preventSleep") private var preventSleep: Bool = true
     @AppStorage("canvas.debugStatusEnabled") private var canvasDebugStatusEnabled: Bool = false
+    @AppStorage("gateway.onboardingComplete") private var onboardingComplete: Bool = false
+    @AppStorage("gateway.hasConnectedOnce") private var hasConnectedOnce: Bool = false
+    @AppStorage("gateway.preferredStableID") private var preferredGatewayStableID: String = ""
+    @AppStorage("gateway.manual.enabled") private var manualGatewayEnabled: Bool = false
+    @AppStorage("gateway.manual.host") private var manualGatewayHost: String = ""
     @State private var presentedSheet: PresentedSheet?
     @State private var voiceWakeToastText: String?
     @State private var toastDismissTask: Task<Void, Never>?
+    @State private var didAutoOpenSettings: Bool = false
 
     private enum PresentedSheet: Identifiable {
         case settings
@@ -29,7 +35,7 @@ struct RootCanvas: View {
         ZStack {
             CanvasContent(
                 systemColorScheme: self.systemColorScheme,
-                bridgeStatus: self.bridgeStatus,
+                gatewayStatus: self.gatewayStatus,
                 voiceWakeEnabled: self.voiceWakeEnabled,
                 voiceWakeToastText: self.voiceWakeToastText,
                 cameraHUDText: self.appModel.cameraHUDText,
@@ -52,19 +58,28 @@ struct RootCanvas: View {
                 SettingsTab()
             case .chat:
                 ChatSheet(
-                    bridge: self.appModel.bridgeSession,
+                    gateway: self.appModel.operatorSession,
                     sessionKey: self.appModel.mainSessionKey,
+                    agentName: self.appModel.activeAgentName,
                     userAccent: self.appModel.seamColor)
             }
         }
         .onAppear { self.updateIdleTimer() }
+        .onAppear { self.maybeAutoOpenSettings() }
         .onChange(of: self.preventSleep) { _, _ in self.updateIdleTimer() }
         .onChange(of: self.scenePhase) { _, _ in self.updateIdleTimer() }
         .onAppear { self.updateCanvasDebugStatus() }
         .onChange(of: self.canvasDebugStatusEnabled) { _, _ in self.updateCanvasDebugStatus() }
-        .onChange(of: self.appModel.bridgeStatusText) { _, _ in self.updateCanvasDebugStatus() }
-        .onChange(of: self.appModel.bridgeServerName) { _, _ in self.updateCanvasDebugStatus() }
-        .onChange(of: self.appModel.bridgeRemoteAddress) { _, _ in self.updateCanvasDebugStatus() }
+        .onChange(of: self.appModel.gatewayStatusText) { _, _ in self.updateCanvasDebugStatus() }
+        .onChange(of: self.appModel.gatewayServerName) { _, _ in self.updateCanvasDebugStatus() }
+        .onChange(of: self.appModel.gatewayRemoteAddress) { _, _ in self.updateCanvasDebugStatus() }
+        .onChange(of: self.appModel.gatewayServerName) { _, newValue in
+            if newValue != nil {
+                self.onboardingComplete = true
+                self.hasConnectedOnce = true
+            }
+            self.maybeAutoOpenSettings()
+        }
         .onChange(of: self.voiceWake.lastTriggeredCommand) { _, newValue in
             guard let newValue else { return }
             let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -91,10 +106,10 @@ struct RootCanvas: View {
         }
     }
 
-    private var bridgeStatus: StatusPill.BridgeState {
-        if self.appModel.bridgeServerName != nil { return .connected }
+    private var gatewayStatus: StatusPill.GatewayState {
+        if self.appModel.gatewayServerName != nil { return .connected }
 
-        let text = self.appModel.bridgeStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = self.appModel.gatewayStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.localizedCaseInsensitiveContains("connecting") ||
             text.localizedCaseInsensitiveContains("reconnecting")
         {
@@ -115,9 +130,29 @@ struct RootCanvas: View {
     private func updateCanvasDebugStatus() {
         self.appModel.screen.setDebugStatusEnabled(self.canvasDebugStatusEnabled)
         guard self.canvasDebugStatusEnabled else { return }
-        let title = self.appModel.bridgeStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let subtitle = self.appModel.bridgeServerName ?? self.appModel.bridgeRemoteAddress
+        let title = self.appModel.gatewayStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle = self.appModel.gatewayServerName ?? self.appModel.gatewayRemoteAddress
         self.appModel.screen.updateDebugStatus(title: title, subtitle: subtitle)
+    }
+
+    private func shouldAutoOpenSettings() -> Bool {
+        if self.appModel.gatewayServerName != nil { return false }
+        if !self.hasConnectedOnce { return true }
+        if !self.onboardingComplete { return true }
+        return !self.hasExistingGatewayConfig()
+    }
+
+    private func hasExistingGatewayConfig() -> Bool {
+        if GatewaySettingsStore.loadLastGatewayConnection() != nil { return true }
+        let manualHost = self.manualGatewayHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        return self.manualGatewayEnabled && !manualHost.isEmpty
+    }
+
+    private func maybeAutoOpenSettings() {
+        guard !self.didAutoOpenSettings else { return }
+        guard self.shouldAutoOpenSettings() else { return }
+        self.didAutoOpenSettings = true
+        self.presentedSheet = .settings
     }
 }
 
@@ -125,8 +160,9 @@ private struct CanvasContent: View {
     @Environment(NodeAppModel.self) private var appModel
     @AppStorage("talk.enabled") private var talkEnabled: Bool = false
     @AppStorage("talk.button.enabled") private var talkButtonEnabled: Bool = true
+    @State private var showGatewayActions: Bool = false
     var systemColorScheme: ColorScheme
-    var bridgeStatus: StatusPill.BridgeState
+    var gatewayStatus: StatusPill.GatewayState
     var voiceWakeEnabled: Bool
     var voiceWakeToastText: String?
     var cameraHUDText: String?
@@ -177,12 +213,16 @@ private struct CanvasContent: View {
         }
         .overlay(alignment: .topLeading) {
             StatusPill(
-                bridge: self.bridgeStatus,
+                gateway: self.gatewayStatus,
                 voiceWakeEnabled: self.voiceWakeEnabled,
                 activity: self.statusActivity,
                 brighten: self.brightenButtons,
                 onTap: {
-                    self.openSettings()
+                    if self.gatewayStatus == .connected {
+                        self.showGatewayActions = true
+                    } else {
+                        self.openSettings()
+                    }
                 })
                 .padding(.leading, 10)
                 .safeAreaPadding(.top, 10)
@@ -197,6 +237,21 @@ private struct CanvasContent: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+        .confirmationDialog(
+            "Gateway",
+            isPresented: self.$showGatewayActions,
+            titleVisibility: .visible)
+        {
+            Button("Disconnect", role: .destructive) {
+                self.appModel.disconnectGateway()
+            }
+            Button("Open Settings") {
+                self.openSettings()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Disconnect from the gateway?")
+        }
     }
 
     private var statusActivity: StatusPill.Activity? {
@@ -208,15 +263,15 @@ private struct CanvasContent: View {
                 tint: .orange)
         }
 
-        let bridgeStatus = self.appModel.bridgeStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let bridgeLower = bridgeStatus.lowercased()
-        if bridgeLower.contains("repair") {
+        let gatewayStatus = self.appModel.gatewayStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let gatewayLower = gatewayStatus.lowercased()
+        if gatewayLower.contains("repair") {
             return StatusPill.Activity(title: "Repairing…", systemImage: "wrench.and.screwdriver", tint: .orange)
         }
-        if bridgeLower.contains("approval") || bridgeLower.contains("pairing") {
+        if gatewayLower.contains("approval") || gatewayLower.contains("pairing") {
             return StatusPill.Activity(title: "Approval pending", systemImage: "person.crop.circle.badge.clock")
         }
-        // Avoid duplicating the primary bridge status ("Connecting…") in the activity slot.
+        // Avoid duplicating the primary gateway status ("Connecting…") in the activity slot.
 
         if self.appModel.screenRecordActive {
             return StatusPill.Activity(title: "Recording screen…", systemImage: "record.circle.fill", tint: .red)
@@ -248,6 +303,10 @@ private struct CanvasContent: View {
                 return StatusPill.Activity(title: "Mic permission", systemImage: "mic.slash", tint: .orange)
             }
             if voiceStatus == "Paused" {
+                // Talk mode intentionally pauses voice wake to release the mic. Don't spam the HUD for that case.
+                if self.appModel.talkMode.isEnabled {
+                    return nil
+                }
                 let suffix = self.appModel.isBackgrounded ? " (background)" : ""
                 return StatusPill.Activity(title: "Voice Wake paused\(suffix)", systemImage: "pause.circle.fill")
             }

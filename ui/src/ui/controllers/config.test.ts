@@ -1,154 +1,42 @@
 import { describe, expect, it, vi } from "vitest";
-
 import {
   applyConfigSnapshot,
   applyConfig,
   runUpdate,
   updateConfigFormValue,
   type ConfigState,
-} from "./config";
-import {
-  defaultDiscordActions,
-  defaultSlackActions,
-  type DiscordForm,
-  type IMessageForm,
-  type SignalForm,
-  type SlackForm,
-  type TelegramForm,
-} from "../ui-types";
-
-const baseTelegramForm: TelegramForm = {
-  token: "",
-  requireMention: true,
-  groupsWildcardEnabled: false,
-  allowFrom: "",
-  proxy: "",
-  webhookUrl: "",
-  webhookSecret: "",
-  webhookPath: "",
-};
-
-const baseDiscordForm: DiscordForm = {
-  enabled: true,
-  token: "",
-  dmEnabled: true,
-  allowFrom: "",
-  groupEnabled: false,
-  groupChannels: "",
-  mediaMaxMb: "",
-  historyLimit: "",
-  textChunkLimit: "",
-  replyToMode: "off",
-  guilds: [],
-  actions: { ...defaultDiscordActions },
-  slashEnabled: false,
-  slashName: "",
-  slashSessionPrefix: "",
-  slashEphemeral: true,
-};
-
-const baseSlackForm: SlackForm = {
-  enabled: true,
-  botToken: "",
-  appToken: "",
-  dmEnabled: true,
-  allowFrom: "",
-  groupEnabled: false,
-  groupChannels: "",
-  mediaMaxMb: "",
-  textChunkLimit: "",
-  reactionNotifications: "own",
-  reactionAllowlist: "",
-  slashEnabled: false,
-  slashName: "",
-  slashSessionPrefix: "",
-  slashEphemeral: true,
-  actions: { ...defaultSlackActions },
-  channels: [],
-};
-
-const baseSignalForm: SignalForm = {
-  enabled: true,
-  account: "",
-  httpUrl: "",
-  httpHost: "",
-  httpPort: "",
-  cliPath: "",
-  autoStart: true,
-  receiveMode: "",
-  ignoreAttachments: false,
-  ignoreStories: false,
-  sendReadReceipts: false,
-  allowFrom: "",
-  mediaMaxMb: "",
-};
-
-const baseIMessageForm: IMessageForm = {
-  enabled: true,
-  cliPath: "",
-  dbPath: "",
-  service: "auto",
-  region: "",
-  allowFrom: "",
-  includeAttachments: false,
-  mediaMaxMb: "",
-};
+} from "./config.ts";
 
 function createState(): ConfigState {
   return {
-    client: null,
-    connected: false,
     applySessionKey: "main",
-    configLoading: false,
-    configRaw: "",
-    configValid: null,
-    configIssues: [],
-    configSaving: false,
+    client: null,
+    configActiveSection: null,
+    configActiveSubsection: null,
     configApplying: false,
-    updateRunning: false,
-    configSnapshot: null,
-    configSchema: null,
-    configSchemaVersion: null,
-    configSchemaLoading: false,
-    configUiHints: {},
     configForm: null,
     configFormDirty: false,
     configFormMode: "form",
+    configFormOriginal: null,
+    configIssues: [],
+    configLoading: false,
+    configRaw: "",
+    configRawOriginal: "",
+    configSaving: false,
+    configSchema: null,
+    configSchemaLoading: false,
+    configSchemaVersion: null,
+    configSearchQuery: "",
+    configSnapshot: null,
+    configUiHints: {},
+    configValid: null,
+    connected: false,
     lastError: null,
-    telegramForm: { ...baseTelegramForm },
-    discordForm: { ...baseDiscordForm },
-    slackForm: { ...baseSlackForm },
-    signalForm: { ...baseSignalForm },
-    imessageForm: { ...baseIMessageForm },
-    telegramConfigStatus: null,
-    discordConfigStatus: null,
-    slackConfigStatus: null,
-    signalConfigStatus: null,
-    imessageConfigStatus: null,
+    updateRunning: false,
   };
 }
 
 describe("applyConfigSnapshot", () => {
-  it("handles missing slack config without throwing", () => {
-    const state = createState();
-    applyConfigSnapshot(state, {
-      config: {
-        channels: {
-          telegram: {},
-          discord: {},
-          signal: {},
-          imessage: {},
-        },
-      },
-      valid: true,
-      issues: [],
-      raw: "{}",
-    });
-
-    expect(state.slackForm.botToken).toBe("");
-    expect(state.slackForm.actions).toEqual(defaultSlackActions);
-  });
-
   it("does not clobber form edits while dirty", () => {
     const state = createState();
     state.configFormMode = "form";
@@ -160,12 +48,55 @@ describe("applyConfigSnapshot", () => {
       config: { gateway: { mode: "remote", port: 9999 } },
       valid: true,
       issues: [],
-      raw: "{\n  \"gateway\": { \"mode\": \"remote\", \"port\": 9999 }\n}\n",
+      raw: '{\n  "gateway": { "mode": "remote", "port": 9999 }\n}\n',
     });
 
     expect(state.configRaw).toBe(
-      "{\n  \"gateway\": {\n    \"mode\": \"local\",\n    \"port\": 18789\n  }\n}\n",
+      '{\n  "gateway": {\n    "mode": "local",\n    "port": 18789\n  }\n}\n',
     );
+  });
+
+  it("updates config form when clean", () => {
+    const state = createState();
+    applyConfigSnapshot(state, {
+      config: { gateway: { mode: "local" } },
+      valid: true,
+      issues: [],
+      raw: "{}",
+    });
+
+    expect(state.configForm).toEqual({ gateway: { mode: "local" } });
+  });
+
+  it("sets configRawOriginal when clean for change detection", () => {
+    const state = createState();
+    applyConfigSnapshot(state, {
+      config: { gateway: { mode: "local" } },
+      valid: true,
+      issues: [],
+      raw: '{ "gateway": { "mode": "local" } }',
+    });
+
+    expect(state.configRawOriginal).toBe('{ "gateway": { "mode": "local" } }');
+    expect(state.configFormOriginal).toEqual({ gateway: { mode: "local" } });
+  });
+
+  it("preserves configRawOriginal when dirty", () => {
+    const state = createState();
+    state.configFormDirty = true;
+    state.configRawOriginal = '{ "original": true }';
+    state.configFormOriginal = { original: true };
+
+    applyConfigSnapshot(state, {
+      config: { gateway: { mode: "local" } },
+      valid: true,
+      issues: [],
+      raw: '{ "gateway": { "mode": "local" } }',
+    });
+
+    // Original values should be preserved when dirty
+    expect(state.configRawOriginal).toBe('{ "original": true }');
+    expect(state.configFormOriginal).toEqual({ original: true });
   });
 });
 
@@ -200,7 +131,7 @@ describe("updateConfigFormValue", () => {
     updateConfigFormValue(state, ["gateway", "port"], 18789);
 
     expect(state.configRaw).toBe(
-      "{\n  \"gateway\": {\n    \"mode\": \"local\",\n    \"port\": 18789\n  }\n}\n",
+      '{\n  "gateway": {\n    "mode": "local",\n    "port": 18789\n  }\n}\n',
     );
   });
 });
@@ -213,7 +144,7 @@ describe("applyConfig", () => {
     state.client = { request } as unknown as ConfigState["client"];
     state.applySessionKey = "agent:main:whatsapp:dm:+15555550123";
     state.configFormMode = "raw";
-    state.configRaw = "{\n  agent: { workspace: \"~/clawd\" }\n}\n";
+    state.configRaw = '{\n  agent: { workspace: "~/openclaw" }\n}\n';
     state.configSnapshot = {
       hash: "hash-123",
     };
@@ -221,7 +152,7 @@ describe("applyConfig", () => {
     await applyConfig(state);
 
     expect(request).toHaveBeenCalledWith("config.apply", {
-      raw: "{\n  agent: { workspace: \"~/clawd\" }\n}\n",
+      raw: '{\n  agent: { workspace: "~/openclaw" }\n}\n',
       baseHash: "hash-123",
       sessionKey: "agent:main:whatsapp:dm:+15555550123",
     });

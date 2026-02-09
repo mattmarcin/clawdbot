@@ -12,6 +12,51 @@ export type RestartAttempt = {
 };
 
 const SPAWN_TIMEOUT_MS = 2000;
+const SIGUSR1_AUTH_GRACE_MS = 5000;
+
+let sigusr1AuthorizedCount = 0;
+let sigusr1AuthorizedUntil = 0;
+let sigusr1ExternalAllowed = false;
+
+function resetSigusr1AuthorizationIfExpired(now = Date.now()) {
+  if (sigusr1AuthorizedCount <= 0) {
+    return;
+  }
+  if (now <= sigusr1AuthorizedUntil) {
+    return;
+  }
+  sigusr1AuthorizedCount = 0;
+  sigusr1AuthorizedUntil = 0;
+}
+
+export function setGatewaySigusr1RestartPolicy(opts?: { allowExternal?: boolean }) {
+  sigusr1ExternalAllowed = opts?.allowExternal === true;
+}
+
+export function isGatewaySigusr1RestartExternallyAllowed() {
+  return sigusr1ExternalAllowed;
+}
+
+export function authorizeGatewaySigusr1Restart(delayMs = 0) {
+  const delay = Math.max(0, Math.floor(delayMs));
+  const expiresAt = Date.now() + delay + SIGUSR1_AUTH_GRACE_MS;
+  sigusr1AuthorizedCount += 1;
+  if (expiresAt > sigusr1AuthorizedUntil) {
+    sigusr1AuthorizedUntil = expiresAt;
+  }
+}
+
+export function consumeGatewaySigusr1RestartAuthorization(): boolean {
+  resetSigusr1AuthorizationIfExpired();
+  if (sigusr1AuthorizedCount <= 0) {
+    return false;
+  }
+  sigusr1AuthorizedCount -= 1;
+  if (sigusr1AuthorizedCount <= 0) {
+    sigusr1AuthorizedUntil = 0;
+  }
+  return true;
+}
 
 function formatSpawnDetail(result: {
   error?: unknown;
@@ -24,8 +69,12 @@ function formatSpawnDetail(result: {
     return text.replace(/\s+/g, " ").trim();
   };
   if (result.error) {
-    if (result.error instanceof Error) return result.error.message;
-    if (typeof result.error === "string") return result.error;
+    if (result.error instanceof Error) {
+      return result.error.message;
+    }
+    if (typeof result.error === "string") {
+      return result.error;
+    }
     try {
       return JSON.stringify(result.error);
     } catch {
@@ -33,10 +82,16 @@ function formatSpawnDetail(result: {
     }
   }
   const stderr = clean(result.stderr);
-  if (stderr) return stderr;
+  if (stderr) {
+    return stderr;
+  }
   const stdout = clean(result.stdout);
-  if (stdout) return stdout;
-  if (typeof result.status === "number") return `exit ${result.status}`;
+  if (stdout) {
+    return stdout;
+  }
+  if (typeof result.status === "number") {
+    return `exit ${result.status}`;
+  }
   return "unknown error";
 }
 
@@ -48,7 +103,7 @@ function normalizeSystemdUnit(raw?: string, profile?: string): string {
   return unit.endsWith(".service") ? unit : `${unit}.service`;
 }
 
-export function triggerClawdbotRestart(): RestartAttempt {
+export function triggerOpenClawRestart(): RestartAttempt {
   if (process.env.VITEST || process.env.NODE_ENV === "test") {
     return { ok: true, method: "supervisor", detail: "test mode" };
   }
@@ -56,8 +111,8 @@ export function triggerClawdbotRestart(): RestartAttempt {
   if (process.platform !== "darwin") {
     if (process.platform === "linux") {
       const unit = normalizeSystemdUnit(
-        process.env.CLAWDBOT_SYSTEMD_UNIT,
-        process.env.CLAWDBOT_PROFILE,
+        process.env.OPENCLAW_SYSTEMD_UNIT,
+        process.env.OPENCLAW_PROFILE,
       );
       const userArgs = ["--user", "restart", unit];
       tried.push(`systemctl ${userArgs.join(" ")}`);
@@ -91,8 +146,8 @@ export function triggerClawdbotRestart(): RestartAttempt {
   }
 
   const label =
-    process.env.CLAWDBOT_LAUNCHD_LABEL ||
-    resolveGatewayLaunchAgentLabel(process.env.CLAWDBOT_PROFILE);
+    process.env.OPENCLAW_LAUNCHD_LABEL ||
+    resolveGatewayLaunchAgentLabel(process.env.OPENCLAW_PROFILE);
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   const target = uid !== undefined ? `gui/${uid}/${label}` : label;
   const args = ["kickstart", "-k", target];
@@ -134,6 +189,7 @@ export function scheduleGatewaySigusr1Restart(opts?: {
     typeof opts?.reason === "string" && opts.reason.trim()
       ? opts.reason.trim().slice(0, 200)
       : undefined;
+  authorizeGatewaySigusr1Restart(delayMs);
   const pid = process.pid;
   const hasListener = process.listenerCount("SIGUSR1") > 0;
   setTimeout(() => {
@@ -156,3 +212,11 @@ export function scheduleGatewaySigusr1Restart(opts?: {
     mode: hasListener ? "emit" : "signal",
   };
 }
+
+export const __testing = {
+  resetSigusr1State() {
+    sigusr1AuthorizedCount = 0;
+    sigusr1AuthorizedUntil = 0;
+    sigusr1ExternalAllowed = false;
+  },
+};

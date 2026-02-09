@@ -1,32 +1,35 @@
-import { listChannelPlugins } from "../channels/plugins/index.js";
-import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import type { ChannelId } from "../channels/plugins/types.js";
-import type { ClawdbotConfig } from "../config/config.js";
-import { resolveBrowserConfig } from "../browser/config.js";
+import type { OpenClawConfig } from "../config/config.js";
+import type { ExecFn } from "./windows-acl.js";
+import { resolveBrowserConfig, resolveProfile } from "../browser/config.js";
+import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
+import { listChannelPlugins } from "../channels/plugins/index.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import { resolveNativeCommandsEnabled, resolveNativeSkillsEnabled } from "../config/commands.js";
 import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
 import { resolveGatewayAuth } from "../gateway/auth.js";
 import { buildGatewayConnectionDetails } from "../gateway/call.js";
 import { probeGateway } from "../gateway/probe.js";
+import { readChannelAllowFromStore } from "../pairing/pairing-store.js";
 import {
   collectAttackSurfaceSummaryFindings,
   collectExposureMatrixFindings,
   collectHooksHardeningFindings,
   collectIncludeFilePermFindings,
+  collectInstalledSkillsCodeSafetyFindings,
   collectModelHygieneFindings,
+  collectSmallModelRiskFindings,
   collectPluginsTrustFindings,
   collectSecretsInConfigFindings,
+  collectPluginsCodeSafetyFindings,
   collectStateDeepFilesystemFindings,
   collectSyncedFolderFindings,
   readConfigSnapshotForAudit,
 } from "./audit-extra.js";
 import {
-  formatOctal,
-  isGroupReadable,
-  isGroupWritable,
-  isWorldReadable,
-  isWorldWritable,
-  modeBits,
-  safeStat,
+  formatPermissionDetail,
+  formatPermissionRemediation,
+  inspectPathPermissions,
 } from "./audit-fs.js";
 
 export type SecurityAuditSeverity = "info" | "warn" | "critical";
@@ -61,7 +64,9 @@ export type SecurityAuditReport = {
 };
 
 export type SecurityAuditOptions = {
-  config: ClawdbotConfig;
+  config: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
   deep?: boolean;
   includeFilesystem?: boolean;
   includeChannelSecurity?: boolean;
@@ -75,6 +80,8 @@ export type SecurityAuditOptions = {
   plugins?: ReturnType<typeof listChannelPlugins>;
   /** Dependency injection for tests. */
   probeGatewayFn?: typeof probeGateway;
+  /** Dependency injection for tests (Windows ACL checks). */
+  execIcacls?: ExecFn;
 };
 
 function countBySeverity(findings: SecurityAuditFinding[]): SecurityAuditSummary {
@@ -82,15 +89,21 @@ function countBySeverity(findings: SecurityAuditFinding[]): SecurityAuditSummary
   let warn = 0;
   let info = 0;
   for (const f of findings) {
-    if (f.severity === "critical") critical += 1;
-    else if (f.severity === "warn") warn += 1;
-    else info += 1;
+    if (f.severity === "critical") {
+      critical += 1;
+    } else if (f.severity === "warn") {
+      warn += 1;
+    } else {
+      info += 1;
+    }
   }
   return { critical, warn, info };
 }
 
 function normalizeAllowFromList(list: Array<string | number> | undefined | null): string[] {
-  if (!Array.isArray(list)) return [];
+  if (!Array.isArray(list)) {
+    return [];
+  }
   return list.map((v) => String(v).trim()).filter(Boolean);
 }
 
@@ -115,13 +128,19 @@ function classifyChannelWarningSeverity(message: string): SecurityAuditSeverity 
 async function collectFilesystemFindings(params: {
   stateDir: string;
   configPath: string;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  execIcacls?: ExecFn;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
 
-  const stateDirStat = await safeStat(params.stateDir);
-  if (stateDirStat.ok) {
-    const bits = modeBits(stateDirStat.mode);
-    if (stateDirStat.isSymlink) {
+  const stateDirPerms = await inspectPathPermissions(params.stateDir, {
+    env: params.env,
+    platform: params.platform,
+    exec: params.execIcacls,
+  });
+  if (stateDirPerms.ok) {
+    if (stateDirPerms.isSymlink) {
       findings.push({
         checkId: "fs.state_dir.symlink",
         severity: "warn",
@@ -129,37 +148,58 @@ async function collectFilesystemFindings(params: {
         detail: `${params.stateDir} is a symlink; treat this as an extra trust boundary.`,
       });
     }
-    if (isWorldWritable(bits)) {
+    if (stateDirPerms.worldWritable) {
       findings.push({
         checkId: "fs.state_dir.perms_world_writable",
         severity: "critical",
         title: "State dir is world-writable",
-        detail: `${params.stateDir} mode=${formatOctal(bits)}; other users can write into your Clawdbot state.`,
-        remediation: `chmod 700 ${params.stateDir}`,
+        detail: `${formatPermissionDetail(params.stateDir, stateDirPerms)}; other users can write into your OpenClaw state.`,
+        remediation: formatPermissionRemediation({
+          targetPath: params.stateDir,
+          perms: stateDirPerms,
+          isDir: true,
+          posixMode: 0o700,
+          env: params.env,
+        }),
       });
-    } else if (isGroupWritable(bits)) {
+    } else if (stateDirPerms.groupWritable) {
       findings.push({
         checkId: "fs.state_dir.perms_group_writable",
         severity: "warn",
         title: "State dir is group-writable",
-        detail: `${params.stateDir} mode=${formatOctal(bits)}; group users can write into your Clawdbot state.`,
-        remediation: `chmod 700 ${params.stateDir}`,
+        detail: `${formatPermissionDetail(params.stateDir, stateDirPerms)}; group users can write into your OpenClaw state.`,
+        remediation: formatPermissionRemediation({
+          targetPath: params.stateDir,
+          perms: stateDirPerms,
+          isDir: true,
+          posixMode: 0o700,
+          env: params.env,
+        }),
       });
-    } else if (isGroupReadable(bits) || isWorldReadable(bits)) {
+    } else if (stateDirPerms.groupReadable || stateDirPerms.worldReadable) {
       findings.push({
         checkId: "fs.state_dir.perms_readable",
         severity: "warn",
         title: "State dir is readable by others",
-        detail: `${params.stateDir} mode=${formatOctal(bits)}; consider restricting to 700.`,
-        remediation: `chmod 700 ${params.stateDir}`,
+        detail: `${formatPermissionDetail(params.stateDir, stateDirPerms)}; consider restricting to 700.`,
+        remediation: formatPermissionRemediation({
+          targetPath: params.stateDir,
+          perms: stateDirPerms,
+          isDir: true,
+          posixMode: 0o700,
+          env: params.env,
+        }),
       });
     }
   }
 
-  const configStat = await safeStat(params.configPath);
-  if (configStat.ok) {
-    const bits = modeBits(configStat.mode);
-    if (configStat.isSymlink) {
+  const configPerms = await inspectPathPermissions(params.configPath, {
+    env: params.env,
+    platform: params.platform,
+    exec: params.execIcacls,
+  });
+  if (configPerms.ok) {
+    if (configPerms.isSymlink) {
       findings.push({
         checkId: "fs.config.symlink",
         severity: "warn",
@@ -167,29 +207,47 @@ async function collectFilesystemFindings(params: {
         detail: `${params.configPath} is a symlink; make sure you trust its target.`,
       });
     }
-    if (isWorldWritable(bits) || isGroupWritable(bits)) {
+    if (configPerms.worldWritable || configPerms.groupWritable) {
       findings.push({
         checkId: "fs.config.perms_writable",
         severity: "critical",
         title: "Config file is writable by others",
-        detail: `${params.configPath} mode=${formatOctal(bits)}; another user could change gateway/auth/tool policies.`,
-        remediation: `chmod 600 ${params.configPath}`,
+        detail: `${formatPermissionDetail(params.configPath, configPerms)}; another user could change gateway/auth/tool policies.`,
+        remediation: formatPermissionRemediation({
+          targetPath: params.configPath,
+          perms: configPerms,
+          isDir: false,
+          posixMode: 0o600,
+          env: params.env,
+        }),
       });
-    } else if (isWorldReadable(bits)) {
+    } else if (configPerms.worldReadable) {
       findings.push({
         checkId: "fs.config.perms_world_readable",
         severity: "critical",
         title: "Config file is world-readable",
-        detail: `${params.configPath} mode=${formatOctal(bits)}; config can contain tokens and private settings.`,
-        remediation: `chmod 600 ${params.configPath}`,
+        detail: `${formatPermissionDetail(params.configPath, configPerms)}; config can contain tokens and private settings.`,
+        remediation: formatPermissionRemediation({
+          targetPath: params.configPath,
+          perms: configPerms,
+          isDir: false,
+          posixMode: 0o600,
+          env: params.env,
+        }),
       });
-    } else if (isGroupReadable(bits)) {
+    } else if (configPerms.groupReadable) {
       findings.push({
         checkId: "fs.config.perms_group_readable",
         severity: "warn",
         title: "Config file is group-readable",
-        detail: `${params.configPath} mode=${formatOctal(bits)}; config can contain tokens and private settings.`,
-        remediation: `chmod 600 ${params.configPath}`,
+        detail: `${formatPermissionDetail(params.configPath, configPerms)}; config can contain tokens and private settings.`,
+        remediation: formatPermissionRemediation({
+          targetPath: params.configPath,
+          perms: configPerms,
+          isDir: false,
+          posixMode: 0o600,
+          env: params.env,
+        }),
       });
     }
   }
@@ -197,20 +255,59 @@ async function collectFilesystemFindings(params: {
   return findings;
 }
 
-function collectGatewayConfigFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+function collectGatewayConfigFindings(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv,
+): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
 
   const bind = typeof cfg.gateway?.bind === "string" ? cfg.gateway.bind : "loopback";
   const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
-  const auth = resolveGatewayAuth({ authConfig: cfg.gateway?.auth, tailscaleMode });
+  const auth = resolveGatewayAuth({ authConfig: cfg.gateway?.auth, tailscaleMode, env });
+  const controlUiEnabled = cfg.gateway?.controlUi?.enabled !== false;
+  const trustedProxies = Array.isArray(cfg.gateway?.trustedProxies)
+    ? cfg.gateway.trustedProxies
+    : [];
+  const hasToken = typeof auth.token === "string" && auth.token.trim().length > 0;
+  const hasPassword = typeof auth.password === "string" && auth.password.trim().length > 0;
+  const hasSharedSecret =
+    (auth.mode === "token" && hasToken) || (auth.mode === "password" && hasPassword);
+  const hasTailscaleAuth = auth.allowTailscale && tailscaleMode === "serve";
+  const hasGatewayAuth = hasSharedSecret || hasTailscaleAuth;
 
-  if (bind !== "loopback" && auth.mode === "none") {
+  if (bind !== "loopback" && !hasSharedSecret) {
     findings.push({
       checkId: "gateway.bind_no_auth",
       severity: "critical",
       title: "Gateway binds beyond loopback without auth",
       detail: `gateway.bind="${bind}" but no gateway.auth token/password is configured.`,
       remediation: `Set gateway.auth (token recommended) or bind to loopback.`,
+    });
+  }
+
+  if (bind === "loopback" && controlUiEnabled && trustedProxies.length === 0) {
+    findings.push({
+      checkId: "gateway.trusted_proxies_missing",
+      severity: "warn",
+      title: "Reverse proxy headers are not trusted",
+      detail:
+        "gateway.bind is loopback and gateway.trustedProxies is empty. " +
+        "If you expose the Control UI through a reverse proxy, configure trusted proxies " +
+        "so local-client checks cannot be spoofed.",
+      remediation:
+        "Set gateway.trustedProxies to your proxy IPs or keep the Control UI local-only.",
+    });
+  }
+
+  if (bind === "loopback" && controlUiEnabled && !hasGatewayAuth) {
+    findings.push({
+      checkId: "gateway.loopback_no_auth",
+      severity: "critical",
+      title: "Gateway auth missing on loopback",
+      detail:
+        "gateway.bind is loopback but no gateway auth secret is configured. " +
+        "If the Control UI is exposed through a reverse proxy, unauthenticated access is possible.",
+      remediation: "Set gateway.auth (token recommended) or keep the Control UI local-only.",
     });
   }
 
@@ -231,6 +328,28 @@ function collectGatewayConfigFindings(cfg: ClawdbotConfig): SecurityAuditFinding
     });
   }
 
+  if (cfg.gateway?.controlUi?.allowInsecureAuth === true) {
+    findings.push({
+      checkId: "gateway.control_ui.insecure_auth",
+      severity: "critical",
+      title: "Control UI allows insecure HTTP auth",
+      detail:
+        "gateway.controlUi.allowInsecureAuth=true allows token-only auth over HTTP and skips device identity.",
+      remediation: "Disable it or switch to HTTPS (Tailscale Serve) or localhost.",
+    });
+  }
+
+  if (cfg.gateway?.controlUi?.dangerouslyDisableDeviceAuth === true) {
+    findings.push({
+      checkId: "gateway.control_ui.device_auth_disabled",
+      severity: "critical",
+      title: "DANGEROUS: Control UI device auth disabled",
+      detail:
+        "gateway.controlUi.dangerouslyDisableDeviceAuth=true disables device identity checks for the Control UI.",
+      remediation: "Disable it unless you are in a short-lived break-glass scenario.",
+    });
+  }
+
   const token =
     typeof auth.token === "string" && auth.token.trim().length > 0 ? auth.token.trim() : null;
   if (auth.mode === "token" && token && token.length < 24) {
@@ -245,82 +364,45 @@ function collectGatewayConfigFindings(cfg: ClawdbotConfig): SecurityAuditFinding
   return findings;
 }
 
-function isLoopbackClientHost(hostname: string): boolean {
-  const h = hostname.trim().toLowerCase();
-  return h === "localhost" || h === "127.0.0.1" || h === "::1";
-}
-
-function collectBrowserControlFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+function collectBrowserControlFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
 
   let resolved: ReturnType<typeof resolveBrowserConfig>;
   try {
-    resolved = resolveBrowserConfig(cfg.browser);
+    resolved = resolveBrowserConfig(cfg.browser, cfg);
   } catch (err) {
     findings.push({
       checkId: "browser.control_invalid_config",
       severity: "warn",
       title: "Browser control config looks invalid",
       detail: String(err),
-      remediation: `Fix browser.controlUrl/browser.cdpUrl in ${resolveConfigPath()} and re-run "clawdbot security audit --deep".`,
+      remediation: `Fix browser.cdpUrl in ${resolveConfigPath()} and re-run "${formatCliCommand("openclaw security audit --deep")}".`,
     });
     return findings;
   }
 
-  if (!resolved.enabled) return findings;
+  if (!resolved.enabled) {
+    return findings;
+  }
 
-  const url = new URL(resolved.controlUrl);
-  const isLoopback = isLoopbackClientHost(url.hostname);
-  const envToken = process.env.CLAWDBOT_BROWSER_CONTROL_TOKEN?.trim();
-  const controlToken = (envToken || resolved.controlToken)?.trim() || null;
-
-  if (!isLoopback) {
-    if (!controlToken) {
-      findings.push({
-        checkId: "browser.control_remote_no_token",
-        severity: "critical",
-        title: "Remote browser control is missing an auth token",
-        detail: `browser.controlUrl is non-loopback (${resolved.controlUrl}) but no browser.controlToken (or CLAWDBOT_BROWSER_CONTROL_TOKEN) is configured.`,
-        remediation:
-          "Set browser.controlToken (or export CLAWDBOT_BROWSER_CONTROL_TOKEN) and prefer serving over Tailscale Serve or HTTPS reverse proxy.",
-      });
+  for (const name of Object.keys(resolved.profiles)) {
+    const profile = resolveProfile(resolved, name);
+    if (!profile || profile.cdpIsLoopback) {
+      continue;
     }
-
+    let url: URL;
+    try {
+      url = new URL(profile.cdpUrl);
+    } catch {
+      continue;
+    }
     if (url.protocol === "http:") {
       findings.push({
-        checkId: "browser.control_remote_http",
+        checkId: "browser.remote_cdp_http",
         severity: "warn",
-        title: "Remote browser control uses HTTP",
-        detail: `browser.controlUrl=${resolved.controlUrl} is http; this is OK only if it's tailnet-only (Tailscale) or behind another encrypted tunnel.`,
-        remediation: `Prefer HTTPS termination (Tailscale Serve) and keep the endpoint tailnet-only.`,
-      });
-    }
-
-    if (controlToken && controlToken.length < 24) {
-      findings.push({
-        checkId: "browser.control_token_too_short",
-        severity: "warn",
-        title: "Browser control token looks short",
-        detail: `browser control token is ${controlToken.length} chars; prefer a long random token.`,
-      });
-    }
-
-    const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
-    const gatewayAuth = resolveGatewayAuth({ authConfig: cfg.gateway?.auth, tailscaleMode });
-    const gatewayToken =
-      gatewayAuth.mode === "token" &&
-      typeof gatewayAuth.token === "string" &&
-      gatewayAuth.token.trim()
-        ? gatewayAuth.token.trim()
-        : null;
-
-    if (controlToken && gatewayToken && controlToken === gatewayToken) {
-      findings.push({
-        checkId: "browser.control_token_reuse_gateway_token",
-        severity: "warn",
-        title: "Browser control token reuses the Gateway token",
-        detail: `browser.controlToken matches gateway.auth token; compromise of browser control expands blast radius to the Gateway API.`,
-        remediation: `Use a separate browser.controlToken dedicated to browser control.`,
+        title: "Remote CDP uses HTTP",
+        detail: `browser profile "${name}" uses http CDP (${profile.cdpUrl}); this is OK only if it's tailnet-only or behind an encrypted tunnel.`,
+        remediation: `Prefer HTTPS/TLS or a tailnet-only endpoint for remote CDP.`,
       });
     }
   }
@@ -328,9 +410,11 @@ function collectBrowserControlFindings(cfg: ClawdbotConfig): SecurityAuditFindin
   return findings;
 }
 
-function collectLoggingFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+function collectLoggingFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const redact = cfg.logging?.redactSensitive;
-  if (redact !== "off") return [];
+  if (redact !== "off") {
+    return [];
+  }
   return [
     {
       checkId: "logging.redact_off",
@@ -342,14 +426,18 @@ function collectLoggingFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
   ];
 }
 
-function collectElevatedFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
+function collectElevatedFindings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
   const enabled = cfg.tools?.elevated?.enabled;
   const allowFrom = cfg.tools?.elevated?.allowFrom ?? {};
   const anyAllowFromKeys = Object.keys(allowFrom).length > 0;
 
-  if (enabled === false) return findings;
-  if (!anyAllowFromKeys) return findings;
+  if (enabled === false) {
+    return findings;
+  }
+  if (!anyAllowFromKeys) {
+    return findings;
+  }
 
   for (const [provider, list] of Object.entries(allowFrom)) {
     const normalized = normalizeAllowFromList(list);
@@ -374,10 +462,23 @@ function collectElevatedFindings(cfg: ClawdbotConfig): SecurityAuditFinding[] {
 }
 
 async function collectChannelSecurityFindings(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   plugins: ReturnType<typeof listChannelPlugins>;
 }): Promise<SecurityAuditFinding[]> {
   const findings: SecurityAuditFinding[] = [];
+
+  const coerceNativeSetting = (value: unknown): boolean | "auto" | undefined => {
+    if (value === true) {
+      return true;
+    }
+    if (value === false) {
+      return false;
+    }
+    if (value === "auto") {
+      return "auto";
+    }
+    return undefined;
+  };
 
   const warnDmPolicy = async (input: {
     label: string;
@@ -386,10 +487,25 @@ async function collectChannelSecurityFindings(params: {
     allowFrom?: Array<string | number> | null;
     policyPath?: string;
     allowFromPath: string;
+    normalizeEntry?: (raw: string) => string;
   }) => {
     const policyPath = input.policyPath ?? `${input.allowFromPath}policy`;
     const configAllowFrom = normalizeAllowFromList(input.allowFrom);
     const hasWildcard = configAllowFrom.includes("*");
+    const dmScope = params.cfg.session?.dmScope ?? "main";
+    const storeAllowFrom = await readChannelAllowFromStore(input.provider).catch(() => []);
+    const normalizeEntry = input.normalizeEntry ?? ((value: string) => value);
+    const normalizedCfg = configAllowFrom
+      .filter((value) => value !== "*")
+      .map((value) => normalizeEntry(value))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const normalizedStore = storeAllowFrom
+      .map((value) => normalizeEntry(value))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const allowCount = Array.from(new Set([...normalizedCfg, ...normalizedStore])).length;
+    const isMultiUserDm = hasWildcard || allowCount > 1;
 
     if (input.dmPolicy === "open") {
       const allowFromKey = `${input.allowFromPath}allowFrom`;
@@ -408,7 +524,6 @@ async function collectChannelSecurityFindings(params: {
           detail: `"open" requires ${allowFromKey} to include "*".`,
         });
       }
-      return;
     }
 
     if (input.dmPolicy === "disabled") {
@@ -418,11 +533,26 @@ async function collectChannelSecurityFindings(params: {
         title: `${input.label} DMs are disabled`,
         detail: `${policyPath}="disabled" ignores inbound DMs.`,
       });
+      return;
+    }
+
+    if (dmScope === "main" && isMultiUserDm) {
+      findings.push({
+        checkId: `channels.${input.provider}.dm.scope_main_multiuser`,
+        severity: "warn",
+        title: `${input.label} DMs share the main session`,
+        detail:
+          "Multiple DM senders currently share the main session, which can leak context across users.",
+        remediation:
+          'Set session.dmScope="per-channel-peer" (or "per-account-channel-peer" for multi-account channels) to isolate DM sessions per sender.',
+      });
     }
   };
 
   for (const plugin of params.plugins) {
-    if (!plugin.security) continue;
+    if (!plugin.security) {
+      continue;
+    }
     const accountIds = plugin.config.listAccountIds(params.cfg);
     const defaultAccountId = resolveChannelDefaultAccountId({
       plugin,
@@ -431,11 +561,165 @@ async function collectChannelSecurityFindings(params: {
     });
     const account = plugin.config.resolveAccount(params.cfg, defaultAccountId);
     const enabled = plugin.config.isEnabled ? plugin.config.isEnabled(account, params.cfg) : true;
-    if (!enabled) continue;
+    if (!enabled) {
+      continue;
+    }
     const configured = plugin.config.isConfigured
       ? await plugin.config.isConfigured(account, params.cfg)
       : true;
-    if (!configured) continue;
+    if (!configured) {
+      continue;
+    }
+
+    if (plugin.id === "discord") {
+      const discordCfg =
+        (account as { config?: Record<string, unknown> } | null)?.config ??
+        ({} as Record<string, unknown>);
+      const nativeEnabled = resolveNativeCommandsEnabled({
+        providerId: "discord",
+        providerSetting: coerceNativeSetting(
+          (discordCfg.commands as { native?: unknown } | undefined)?.native,
+        ),
+        globalSetting: params.cfg.commands?.native,
+      });
+      const nativeSkillsEnabled = resolveNativeSkillsEnabled({
+        providerId: "discord",
+        providerSetting: coerceNativeSetting(
+          (discordCfg.commands as { nativeSkills?: unknown } | undefined)?.nativeSkills,
+        ),
+        globalSetting: params.cfg.commands?.nativeSkills,
+      });
+      const slashEnabled = nativeEnabled || nativeSkillsEnabled;
+      if (slashEnabled) {
+        const defaultGroupPolicy = params.cfg.channels?.defaults?.groupPolicy;
+        const groupPolicy =
+          (discordCfg.groupPolicy as string | undefined) ?? defaultGroupPolicy ?? "allowlist";
+        const guildEntries = (discordCfg.guilds as Record<string, unknown> | undefined) ?? {};
+        const guildsConfigured = Object.keys(guildEntries).length > 0;
+        const hasAnyUserAllowlist = Object.values(guildEntries).some((guild) => {
+          if (!guild || typeof guild !== "object") {
+            return false;
+          }
+          const g = guild as Record<string, unknown>;
+          if (Array.isArray(g.users) && g.users.length > 0) {
+            return true;
+          }
+          const channels = g.channels;
+          if (!channels || typeof channels !== "object") {
+            return false;
+          }
+          return Object.values(channels as Record<string, unknown>).some((channel) => {
+            if (!channel || typeof channel !== "object") {
+              return false;
+            }
+            const c = channel as Record<string, unknown>;
+            return Array.isArray(c.users) && c.users.length > 0;
+          });
+        });
+        const dmAllowFromRaw = (discordCfg.dm as { allowFrom?: unknown } | undefined)?.allowFrom;
+        const dmAllowFrom = Array.isArray(dmAllowFromRaw) ? dmAllowFromRaw : [];
+        const storeAllowFrom = await readChannelAllowFromStore("discord").catch(() => []);
+        const ownerAllowFromConfigured =
+          normalizeAllowFromList([...dmAllowFrom, ...storeAllowFrom]).length > 0;
+
+        const useAccessGroups = params.cfg.commands?.useAccessGroups !== false;
+        if (
+          !useAccessGroups &&
+          groupPolicy !== "disabled" &&
+          guildsConfigured &&
+          !hasAnyUserAllowlist
+        ) {
+          findings.push({
+            checkId: "channels.discord.commands.native.unrestricted",
+            severity: "critical",
+            title: "Discord slash commands are unrestricted",
+            detail:
+              "commands.useAccessGroups=false disables sender allowlists for Discord slash commands unless a per-guild/channel users allowlist is configured; with no users allowlist, any user in allowed guild channels can invoke /… commands.",
+            remediation:
+              "Set commands.useAccessGroups=true (recommended), or configure channels.discord.guilds.<id>.users (or channels.discord.guilds.<id>.channels.<channel>.users).",
+          });
+        } else if (
+          useAccessGroups &&
+          groupPolicy !== "disabled" &&
+          guildsConfigured &&
+          !ownerAllowFromConfigured &&
+          !hasAnyUserAllowlist
+        ) {
+          findings.push({
+            checkId: "channels.discord.commands.native.no_allowlists",
+            severity: "warn",
+            title: "Discord slash commands have no allowlists",
+            detail:
+              "Discord slash commands are enabled, but neither an owner allowFrom list nor any per-guild/channel users allowlist is configured; /… commands will be rejected for everyone.",
+            remediation:
+              "Add your user id to channels.discord.dm.allowFrom (or approve yourself via pairing), or configure channels.discord.guilds.<id>.users.",
+          });
+        }
+      }
+    }
+
+    if (plugin.id === "slack") {
+      const slackCfg =
+        (account as { config?: Record<string, unknown>; dm?: Record<string, unknown> } | null)
+          ?.config ?? ({} as Record<string, unknown>);
+      const nativeEnabled = resolveNativeCommandsEnabled({
+        providerId: "slack",
+        providerSetting: coerceNativeSetting(
+          (slackCfg.commands as { native?: unknown } | undefined)?.native,
+        ),
+        globalSetting: params.cfg.commands?.native,
+      });
+      const nativeSkillsEnabled = resolveNativeSkillsEnabled({
+        providerId: "slack",
+        providerSetting: coerceNativeSetting(
+          (slackCfg.commands as { nativeSkills?: unknown } | undefined)?.nativeSkills,
+        ),
+        globalSetting: params.cfg.commands?.nativeSkills,
+      });
+      const slashCommandEnabled =
+        nativeEnabled ||
+        nativeSkillsEnabled ||
+        (slackCfg.slashCommand as { enabled?: unknown } | undefined)?.enabled === true;
+      if (slashCommandEnabled) {
+        const useAccessGroups = params.cfg.commands?.useAccessGroups !== false;
+        if (!useAccessGroups) {
+          findings.push({
+            checkId: "channels.slack.commands.slash.useAccessGroups_off",
+            severity: "critical",
+            title: "Slack slash commands bypass access groups",
+            detail:
+              "Slack slash/native commands are enabled while commands.useAccessGroups=false; this can allow unrestricted /… command execution from channels/users you didn't explicitly authorize.",
+            remediation: "Set commands.useAccessGroups=true (recommended).",
+          });
+        } else {
+          const dmAllowFromRaw = (account as { dm?: { allowFrom?: unknown } } | null)?.dm
+            ?.allowFrom;
+          const dmAllowFrom = Array.isArray(dmAllowFromRaw) ? dmAllowFromRaw : [];
+          const storeAllowFrom = await readChannelAllowFromStore("slack").catch(() => []);
+          const ownerAllowFromConfigured =
+            normalizeAllowFromList([...dmAllowFrom, ...storeAllowFrom]).length > 0;
+          const channels = (slackCfg.channels as Record<string, unknown> | undefined) ?? {};
+          const hasAnyChannelUsersAllowlist = Object.values(channels).some((value) => {
+            if (!value || typeof value !== "object") {
+              return false;
+            }
+            const channel = value as Record<string, unknown>;
+            return Array.isArray(channel.users) && channel.users.length > 0;
+          });
+          if (!ownerAllowFromConfigured && !hasAnyChannelUsersAllowlist) {
+            findings.push({
+              checkId: "channels.slack.commands.slash.no_allowlists",
+              severity: "warn",
+              title: "Slack slash commands have no allowlists",
+              detail:
+                "Slack slash/native commands are enabled, but neither an owner allowFrom list nor any channels.<id>.users allowlist is configured; /… commands will be rejected for everyone.",
+              remediation:
+                "Approve yourself via pairing (recommended), or set channels.slack.dm.allowFrom and/or channels.slack.channels.<id>.users.",
+            });
+          }
+        }
+      }
+    }
 
     const dmPolicy = plugin.security.resolveDmPolicy?.({
       cfg: params.cfg,
@@ -450,6 +734,7 @@ async function collectChannelSecurityFindings(params: {
         allowFrom: dmPolicy.allowFrom,
         policyPath: dmPolicy.policyPath,
         allowFromPath: dmPolicy.allowFromPath,
+        normalizeEntry: dmPolicy.normalizeEntry,
       });
     }
 
@@ -461,12 +746,104 @@ async function collectChannelSecurityFindings(params: {
       });
       for (const message of warnings ?? []) {
         const trimmed = String(message).trim();
-        if (!trimmed) continue;
+        if (!trimmed) {
+          continue;
+        }
         findings.push({
           checkId: `channels.${plugin.id}.warning.${findings.length + 1}`,
           severity: classifyChannelWarningSeverity(trimmed),
           title: `${plugin.meta.label ?? plugin.id} security warning`,
           detail: trimmed.replace(/^-\s*/, ""),
+        });
+      }
+    }
+
+    if (plugin.id === "telegram") {
+      const allowTextCommands = params.cfg.commands?.text !== false;
+      if (!allowTextCommands) {
+        continue;
+      }
+
+      const telegramCfg =
+        (account as { config?: Record<string, unknown> } | null)?.config ??
+        ({} as Record<string, unknown>);
+      const defaultGroupPolicy = params.cfg.channels?.defaults?.groupPolicy;
+      const groupPolicy =
+        (telegramCfg.groupPolicy as string | undefined) ?? defaultGroupPolicy ?? "allowlist";
+      const groups = telegramCfg.groups as Record<string, unknown> | undefined;
+      const groupsConfigured = Boolean(groups) && Object.keys(groups ?? {}).length > 0;
+      const groupAccessPossible =
+        groupPolicy === "open" || (groupPolicy === "allowlist" && groupsConfigured);
+      if (!groupAccessPossible) {
+        continue;
+      }
+
+      const storeAllowFrom = await readChannelAllowFromStore("telegram").catch(() => []);
+      const storeHasWildcard = storeAllowFrom.some((v) => String(v).trim() === "*");
+      const groupAllowFrom = Array.isArray(telegramCfg.groupAllowFrom)
+        ? telegramCfg.groupAllowFrom
+        : [];
+      const groupAllowFromHasWildcard = groupAllowFrom.some((v) => String(v).trim() === "*");
+      const anyGroupOverride = Boolean(
+        groups &&
+        Object.values(groups).some((value) => {
+          if (!value || typeof value !== "object") {
+            return false;
+          }
+          const group = value as Record<string, unknown>;
+          const allowFrom = Array.isArray(group.allowFrom) ? group.allowFrom : [];
+          if (allowFrom.length > 0) {
+            return true;
+          }
+          const topics = group.topics;
+          if (!topics || typeof topics !== "object") {
+            return false;
+          }
+          return Object.values(topics as Record<string, unknown>).some((topicValue) => {
+            if (!topicValue || typeof topicValue !== "object") {
+              return false;
+            }
+            const topic = topicValue as Record<string, unknown>;
+            const topicAllow = Array.isArray(topic.allowFrom) ? topic.allowFrom : [];
+            return topicAllow.length > 0;
+          });
+        }),
+      );
+
+      const hasAnySenderAllowlist =
+        storeAllowFrom.length > 0 || groupAllowFrom.length > 0 || anyGroupOverride;
+
+      if (storeHasWildcard || groupAllowFromHasWildcard) {
+        findings.push({
+          checkId: "channels.telegram.groups.allowFrom.wildcard",
+          severity: "critical",
+          title: "Telegram group allowlist contains wildcard",
+          detail:
+            'Telegram group sender allowlist contains "*", which allows any group member to run /… commands and control directives.',
+          remediation:
+            'Remove "*" from channels.telegram.groupAllowFrom and pairing store; prefer explicit user ids/usernames.',
+        });
+        continue;
+      }
+
+      if (!hasAnySenderAllowlist) {
+        const providerSetting = (telegramCfg.commands as { nativeSkills?: unknown } | undefined)
+          // oxlint-disable-next-line typescript/no-explicit-any
+          ?.nativeSkills as any;
+        const skillsEnabled = resolveNativeSkillsEnabled({
+          providerId: "telegram",
+          providerSetting,
+          globalSetting: params.cfg.commands?.nativeSkills,
+        });
+        findings.push({
+          checkId: "channels.telegram.groups.allowFrom.missing",
+          severity: "critical",
+          title: "Telegram group commands have no sender allowlist",
+          detail:
+            `Telegram group access is enabled but no sender allowlist is configured; this allows any group member to invoke /… commands` +
+            (skillsEnabled ? " (including skill commands)." : "."),
+          remediation:
+            "Approve yourself via pairing (recommended), or set channels.telegram.groupAllowFrom (or per-group groups.<id>.allowFrom).",
         });
       }
     }
@@ -476,7 +853,7 @@ async function collectChannelSecurityFindings(params: {
 }
 
 async function maybeProbeGateway(params: {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   timeoutMs: number;
   probe: typeof probeGateway;
 }): Promise<SecurityAuditReport["deep"]> {
@@ -496,10 +873,10 @@ async function maybeProbeGateway(params: {
         ? typeof remote?.token === "string" && remote.token.trim()
           ? remote.token.trim()
           : undefined
-        : process.env.CLAWDBOT_GATEWAY_TOKEN?.trim() ||
+        : process.env.OPENCLAW_GATEWAY_TOKEN?.trim() ||
           (typeof authToken === "string" && authToken.trim() ? authToken.trim() : undefined);
     const password =
-      process.env.CLAWDBOT_GATEWAY_PASSWORD?.trim() ||
+      process.env.OPENCLAW_GATEWAY_PASSWORD?.trim() ||
       (mode === "remote"
         ? typeof remote?.password === "string" && remote.password.trim()
           ? remote.password.trim()
@@ -510,7 +887,7 @@ async function maybeProbeGateway(params: {
     return { token, password };
   };
 
-  const auth = remoteUrlMissing ? resolveAuth("local") : resolveAuth("remote");
+  const auth = !isRemoteMode || remoteUrlMissing ? resolveAuth("local") : resolveAuth("remote");
   const res = await params.probe({ url, auth, timeoutMs: params.timeoutMs }).catch((err) => ({
     ok: false,
     url,
@@ -537,20 +914,23 @@ async function maybeProbeGateway(params: {
 export async function runSecurityAudit(opts: SecurityAuditOptions): Promise<SecurityAuditReport> {
   const findings: SecurityAuditFinding[] = [];
   const cfg = opts.config;
-  const env = process.env;
+  const env = opts.env ?? process.env;
+  const platform = opts.platform ?? process.platform;
+  const execIcacls = opts.execIcacls;
   const stateDir = opts.stateDir ?? resolveStateDir(env);
   const configPath = opts.configPath ?? resolveConfigPath(env, stateDir);
 
   findings.push(...collectAttackSurfaceSummaryFindings(cfg));
   findings.push(...collectSyncedFolderFindings({ stateDir, configPath }));
 
-  findings.push(...collectGatewayConfigFindings(cfg));
+  findings.push(...collectGatewayConfigFindings(cfg, env));
   findings.push(...collectBrowserControlFindings(cfg));
   findings.push(...collectLoggingFindings(cfg));
   findings.push(...collectElevatedFindings(cfg));
   findings.push(...collectHooksHardeningFindings(cfg));
   findings.push(...collectSecretsInConfigFindings(cfg));
   findings.push(...collectModelHygieneFindings(cfg));
+  findings.push(...collectSmallModelRiskFindings({ cfg, env }));
   findings.push(...collectExposureMatrixFindings(cfg));
 
   const configSnapshot =
@@ -559,12 +939,28 @@ export async function runSecurityAudit(opts: SecurityAuditOptions): Promise<Secu
       : null;
 
   if (opts.includeFilesystem !== false) {
-    findings.push(...(await collectFilesystemFindings({ stateDir, configPath })));
+    findings.push(
+      ...(await collectFilesystemFindings({
+        stateDir,
+        configPath,
+        env,
+        platform,
+        execIcacls,
+      })),
+    );
     if (configSnapshot) {
-      findings.push(...(await collectIncludeFilePermFindings({ configSnapshot })));
+      findings.push(
+        ...(await collectIncludeFilePermFindings({ configSnapshot, env, platform, execIcacls })),
+      );
     }
-    findings.push(...(await collectStateDeepFilesystemFindings({ cfg, env, stateDir })));
+    findings.push(
+      ...(await collectStateDeepFilesystemFindings({ cfg, env, stateDir, platform, execIcacls })),
+    );
     findings.push(...(await collectPluginsTrustFindings({ cfg, stateDir })));
+    if (opts.deep === true) {
+      findings.push(...(await collectPluginsCodeSafetyFindings({ stateDir })));
+      findings.push(...(await collectInstalledSkillsCodeSafetyFindings({ cfg, stateDir })));
+    }
   }
 
   if (opts.includeChannelSecurity !== false) {
@@ -581,13 +977,13 @@ export async function runSecurityAudit(opts: SecurityAuditOptions): Promise<Secu
         })
       : undefined;
 
-  if (deep?.gateway?.attempted && deep.gateway.ok === false) {
+  if (deep?.gateway?.attempted && !deep.gateway.ok) {
     findings.push({
       checkId: "gateway.probe_failed",
       severity: "warn",
       title: "Gateway probe failed (deep)",
       detail: deep.gateway.error ?? "gateway unreachable",
-      remediation: `Run "clawdbot status --all" to debug connectivity/auth, then re-run "clawdbot security audit --deep".`,
+      remediation: `Run "${formatCliCommand("openclaw status --all")}" to debug connectivity/auth, then re-run "${formatCliCommand("openclaw security audit --deep")}".`,
     });
   }
 

@@ -1,6 +1,25 @@
 import type { Llama, LlamaEmbeddingContext, LlamaModel } from "node-llama-cpp";
-import { resolveApiKeyForProvider } from "../agents/model-auth.js";
-import type { ClawdbotConfig } from "../config/config.js";
+import fsSync from "node:fs";
+import type { OpenClawConfig } from "../config/config.js";
+import { formatErrorMessage } from "../infra/errors.js";
+import { resolveUserPath } from "../utils.js";
+import { createGeminiEmbeddingProvider, type GeminiEmbeddingClient } from "./embeddings-gemini.js";
+import { createOpenAiEmbeddingProvider, type OpenAiEmbeddingClient } from "./embeddings-openai.js";
+import { createVoyageEmbeddingProvider, type VoyageEmbeddingClient } from "./embeddings-voyage.js";
+import { importNodeLlamaCpp } from "./node-llama.js";
+
+function sanitizeAndNormalizeEmbedding(vec: number[]): number[] {
+  const sanitized = vec.map((value) => (Number.isFinite(value) ? value : 0));
+  const magnitude = Math.sqrt(sanitized.reduce((sum, value) => sum + value * value, 0));
+  if (magnitude < 1e-10) {
+    return sanitized;
+  }
+  return sanitized.map((value) => value / magnitude);
+}
+
+export type { GeminiEmbeddingClient } from "./embeddings-gemini.js";
+export type { OpenAiEmbeddingClient } from "./embeddings-openai.js";
+export type { VoyageEmbeddingClient } from "./embeddings-voyage.js";
 
 export type EmbeddingProvider = {
   id: string;
@@ -11,91 +30,52 @@ export type EmbeddingProvider = {
 
 export type EmbeddingProviderResult = {
   provider: EmbeddingProvider;
-  requestedProvider: "openai" | "local";
-  fallbackFrom?: "local";
+  requestedProvider: "openai" | "local" | "gemini" | "voyage" | "auto";
+  fallbackFrom?: "openai" | "local" | "gemini" | "voyage";
   fallbackReason?: string;
+  openAi?: OpenAiEmbeddingClient;
+  gemini?: GeminiEmbeddingClient;
+  voyage?: VoyageEmbeddingClient;
 };
 
 export type EmbeddingProviderOptions = {
-  config: ClawdbotConfig;
+  config: OpenClawConfig;
   agentDir?: string;
-  provider: "openai" | "local";
+  provider: "openai" | "local" | "gemini" | "voyage" | "auto";
   remote?: {
     baseUrl?: string;
     apiKey?: string;
     headers?: Record<string, string>;
   };
   model: string;
-  fallback: "openai" | "none";
+  fallback: "openai" | "gemini" | "local" | "voyage" | "none";
   local?: {
     modelPath?: string;
     modelCacheDir?: string;
   };
 };
 
-const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_LOCAL_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 
-function normalizeOpenAiModel(model: string): string {
-  const trimmed = model.trim();
-  if (!trimmed) return "text-embedding-3-small";
-  if (trimmed.startsWith("openai/")) return trimmed.slice("openai/".length);
-  return trimmed;
+function canAutoSelectLocal(options: EmbeddingProviderOptions): boolean {
+  const modelPath = options.local?.modelPath?.trim();
+  if (!modelPath) {
+    return false;
+  }
+  if (/^(hf:|https?:)/i.test(modelPath)) {
+    return false;
+  }
+  const resolved = resolveUserPath(modelPath);
+  try {
+    return fsSync.statSync(resolved).isFile();
+  } catch {
+    return false;
+  }
 }
 
-async function createOpenAiEmbeddingProvider(
-  options: EmbeddingProviderOptions,
-): Promise<EmbeddingProvider> {
-  const remote = options.remote;
-  const remoteApiKey = remote?.apiKey?.trim();
-  const remoteBaseUrl = remote?.baseUrl?.trim();
-
-  const { apiKey } = remoteApiKey
-    ? { apiKey: remoteApiKey }
-    : await resolveApiKeyForProvider({
-        provider: "openai",
-        cfg: options.config,
-        agentDir: options.agentDir,
-      });
-
-  const providerConfig = options.config.models?.providers?.openai;
-  const baseUrl = remoteBaseUrl || providerConfig?.baseUrl?.trim() || DEFAULT_OPENAI_BASE_URL;
-  const url = `${baseUrl.replace(/\/$/, "")}/embeddings`;
-  const headerOverrides = Object.assign({}, providerConfig?.headers, remote?.headers);
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-    ...headerOverrides,
-  };
-  const model = normalizeOpenAiModel(options.model);
-
-  const embed = async (input: string[]): Promise<number[][]> => {
-    if (input.length === 0) return [];
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model, input }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`openai embeddings failed: ${res.status} ${text}`);
-    }
-    const payload = (await res.json()) as {
-      data?: Array<{ embedding?: number[] }>;
-    };
-    const data = payload.data ?? [];
-    return data.map((entry) => entry.embedding ?? []);
-  };
-
-  return {
-    id: "openai",
-    model,
-    embedQuery: async (text) => {
-      const [vec] = await embed([text]);
-      return vec ?? [];
-    },
-    embedBatch: embed,
-  };
+function isMissingApiKeyError(err: unknown): boolean {
+  const message = formatErrorMessage(err);
+  return message.includes("No API key found for provider");
 }
 
 async function createLocalEmbeddingProvider(
@@ -105,7 +85,7 @@ async function createLocalEmbeddingProvider(
   const modelCacheDir = options.local?.modelCacheDir?.trim();
 
   // Lazy-load node-llama-cpp to keep startup light unless local is enabled.
-  const { getLlama, resolveModelFile, LlamaLogLevel } = await import("node-llama-cpp");
+  const { getLlama, resolveModelFile, LlamaLogLevel } = await importNodeLlamaCpp();
 
   let llama: Llama | null = null;
   let embeddingModel: LlamaModel | null = null;
@@ -131,14 +111,14 @@ async function createLocalEmbeddingProvider(
     embedQuery: async (text) => {
       const ctx = await ensureContext();
       const embedding = await ctx.getEmbeddingFor(text);
-      return Array.from(embedding.vector) as number[];
+      return sanitizeAndNormalizeEmbedding(Array.from(embedding.vector));
     },
     embedBatch: async (texts) => {
       const ctx = await ensureContext();
       const embeddings = await Promise.all(
         texts.map(async (text) => {
           const embedding = await ctx.getEmbeddingFor(text);
-          return Array.from(embedding.vector) as number[];
+          return sanitizeAndNormalizeEmbedding(Array.from(embedding.vector));
         }),
       );
       return embeddings;
@@ -150,47 +130,118 @@ export async function createEmbeddingProvider(
   options: EmbeddingProviderOptions,
 ): Promise<EmbeddingProviderResult> {
   const requestedProvider = options.provider;
-  if (options.provider === "local") {
-    try {
+  const fallback = options.fallback;
+
+  const createProvider = async (id: "openai" | "local" | "gemini" | "voyage") => {
+    if (id === "local") {
       const provider = await createLocalEmbeddingProvider(options);
-      return { provider, requestedProvider };
-    } catch (err) {
-      const reason = formatLocalSetupError(err);
-      if (options.fallback === "openai") {
-        try {
-          const provider = await createOpenAiEmbeddingProvider(options);
-          return {
-            provider,
-            requestedProvider,
-            fallbackFrom: "local",
-            fallbackReason: reason,
-          };
-        } catch (fallbackErr) {
-          throw new Error(`${reason}\n\nFallback to OpenAI failed: ${formatError(fallbackErr)}`);
-        }
-      }
-      throw new Error(reason);
+      return { provider };
     }
+    if (id === "gemini") {
+      const { provider, client } = await createGeminiEmbeddingProvider(options);
+      return { provider, gemini: client };
+    }
+    if (id === "voyage") {
+      const { provider, client } = await createVoyageEmbeddingProvider(options);
+      return { provider, voyage: client };
+    }
+    const { provider, client } = await createOpenAiEmbeddingProvider(options);
+    return { provider, openAi: client };
+  };
+
+  const formatPrimaryError = (err: unknown, provider: "openai" | "local" | "gemini" | "voyage") =>
+    provider === "local" ? formatLocalSetupError(err) : formatErrorMessage(err);
+
+  if (requestedProvider === "auto") {
+    const missingKeyErrors: string[] = [];
+    let localError: string | null = null;
+
+    if (canAutoSelectLocal(options)) {
+      try {
+        const local = await createProvider("local");
+        return { ...local, requestedProvider };
+      } catch (err) {
+        localError = formatLocalSetupError(err);
+      }
+    }
+
+    for (const provider of ["openai", "gemini", "voyage"] as const) {
+      try {
+        const result = await createProvider(provider);
+        return { ...result, requestedProvider };
+      } catch (err) {
+        const message = formatPrimaryError(err, provider);
+        if (isMissingApiKeyError(err)) {
+          missingKeyErrors.push(message);
+          continue;
+        }
+        throw new Error(message, { cause: err });
+      }
+    }
+
+    const details = [...missingKeyErrors, localError].filter(Boolean) as string[];
+    if (details.length > 0) {
+      throw new Error(details.join("\n\n"));
+    }
+    throw new Error("No embeddings provider available.");
   }
-  const provider = await createOpenAiEmbeddingProvider(options);
-  return { provider, requestedProvider };
+
+  try {
+    const primary = await createProvider(requestedProvider);
+    return { ...primary, requestedProvider };
+  } catch (primaryErr) {
+    const reason = formatPrimaryError(primaryErr, requestedProvider);
+    if (fallback && fallback !== "none" && fallback !== requestedProvider) {
+      try {
+        const fallbackResult = await createProvider(fallback);
+        return {
+          ...fallbackResult,
+          requestedProvider,
+          fallbackFrom: requestedProvider,
+          fallbackReason: reason,
+        };
+      } catch (fallbackErr) {
+        // oxlint-disable-next-line preserve-caught-error
+        throw new Error(
+          `${reason}\n\nFallback to ${fallback} failed: ${formatErrorMessage(fallbackErr)}`,
+          { cause: fallbackErr },
+        );
+      }
+    }
+    throw new Error(reason, { cause: primaryErr });
+  }
 }
 
-function formatError(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
+function isNodeLlamaCppMissing(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const code = (err as Error & { code?: unknown }).code;
+  if (code === "ERR_MODULE_NOT_FOUND") {
+    return err.message.includes("node-llama-cpp");
+  }
+  return false;
 }
 
 function formatLocalSetupError(err: unknown): string {
-  const detail = formatError(err);
+  const detail = formatErrorMessage(err);
+  const missing = isNodeLlamaCppMissing(err);
   return [
     "Local embeddings unavailable.",
-    detail ? `Reason: ${detail}` : undefined,
+    missing
+      ? "Reason: optional dependency node-llama-cpp is missing (or failed to install)."
+      : detail
+        ? `Reason: ${detail}`
+        : undefined,
+    missing && detail ? `Detail: ${detail}` : null,
     "To enable local embeddings:",
-    "1) pnpm approve-builds",
-    "2) select node-llama-cpp",
-    "3) pnpm rebuild node-llama-cpp",
+    "1) Use Node 22 LTS (recommended for installs/updates)",
+    missing
+      ? "2) Reinstall OpenClaw (this should install node-llama-cpp): npm i -g openclaw@latest"
+      : null,
+    "3) If you use pnpm: pnpm approve-builds (select node-llama-cpp), then pnpm rebuild node-llama-cpp",
     'Or set agents.defaults.memorySearch.provider = "openai" (remote).',
+    'Or set agents.defaults.memorySearch.provider = "voyage" (remote).',
   ]
     .filter(Boolean)
     .join("\n");

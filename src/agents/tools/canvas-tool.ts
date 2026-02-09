@@ -1,7 +1,6 @@
+import { Type } from "@sinclair/typebox";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-
-import { Type } from "@sinclair/typebox";
 import { writeBase64ToFile } from "../../cli/nodes-camera.js";
 import { canvasSnapshotTempPath, parseCanvasSnapshotPayload } from "../../cli/nodes-canvas.js";
 import { imageMimeFromFormat } from "../../media/mime.js";
@@ -40,7 +39,7 @@ const CanvasToolSchema = Type.Object({
   // eval
   javaScript: Type.Optional(Type.String()),
   // snapshot
-  format: optionalStringEnum(CANVAS_SNAPSHOT_FORMATS),
+  outputFormat: optionalStringEnum(CANVAS_SNAPSHOT_FORMATS),
   maxWidth: Type.Optional(Type.Number()),
   quality: Type.Optional(Type.Number()),
   delayMs: Type.Optional(Type.Number()),
@@ -127,7 +126,8 @@ export function createCanvasTool(): AnyAgentTool {
           return jsonResult({ ok: true });
         }
         case "snapshot": {
-          const formatRaw = typeof params.format === "string" ? params.format.toLowerCase() : "png";
+          const formatRaw =
+            typeof params.outputFormat === "string" ? params.outputFormat.toLowerCase() : "png";
           const format = formatRaw === "jpg" || formatRaw === "jpeg" ? "jpeg" : "png";
           const maxWidth =
             typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
@@ -163,7 +163,9 @@ export function createCanvasTool(): AnyAgentTool {
               : typeof params.jsonlPath === "string" && params.jsonlPath.trim()
                 ? await fs.readFile(params.jsonlPath.trim(), "utf8")
                 : "";
-          if (!jsonl.trim()) throw new Error("jsonl or jsonlPath required");
+          if (!jsonl.trim()) {
+            throw new Error("jsonl or jsonlPath required");
+          }
           await invoke("canvas.a2ui.pushJSONL", { jsonl });
           return jsonResult({ ok: true });
         }

@@ -1,16 +1,19 @@
-import type { ClawdbotConfig } from "../../config/config.js";
-import { CONFIG_PATH_CLAWDBOT, resolveGatewayPort, writeConfigFile } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import type { RuntimeEnv } from "../../runtime.js";
-import { sleep } from "../../utils.js";
+import type { OnboardOptions } from "../onboard-types.js";
+import { formatCliCommand } from "../../cli/command-format.js";
+import { resolveGatewayPort, writeConfigFile } from "../../config/config.js";
+import { logConfigUpdated } from "../../config/logging.js";
 import { DEFAULT_GATEWAY_DAEMON_RUNTIME } from "../daemon-runtime.js";
 import { healthCommand } from "../health.js";
 import {
   applyWizardMetadata,
   DEFAULT_WORKSPACE,
   ensureWorkspaceAndSessions,
+  resolveControlUiLinks,
+  waitForGatewayReachable,
 } from "../onboard-helpers.js";
-import type { OnboardOptions } from "../onboard-types.js";
-
+import { inferAuthChoiceFromFlags } from "./local/auth-choice-inference.js";
 import { applyNonInteractiveAuthChoice } from "./local/auth-choice.js";
 import { installGatewayDaemonNonInteractive } from "./local/daemon-install.js";
 import { applyNonInteractiveGatewayConfig } from "./local/gateway-config.js";
@@ -21,7 +24,7 @@ import { resolveNonInteractiveWorkspaceDir } from "./local/workspace.js";
 export async function runNonInteractiveOnboardingLocal(params: {
   opts: OnboardOptions;
   runtime: RuntimeEnv;
-  baseConfig: ClawdbotConfig;
+  baseConfig: OpenClawConfig;
 }) {
   const { opts, runtime, baseConfig } = params;
   const mode = "local" as const;
@@ -32,7 +35,7 @@ export async function runNonInteractiveOnboardingLocal(params: {
     defaultWorkspaceDir: DEFAULT_WORKSPACE,
   });
 
-  let nextConfig: ClawdbotConfig = {
+  let nextConfig: OpenClawConfig = {
     ...baseConfig,
     agents: {
       ...baseConfig.agents,
@@ -47,7 +50,19 @@ export async function runNonInteractiveOnboardingLocal(params: {
     },
   };
 
-  const authChoice = opts.authChoice ?? "skip";
+  const inferredAuthChoice = inferAuthChoiceFromFlags(opts);
+  if (!opts.authChoice && inferredAuthChoice.matches.length > 1) {
+    runtime.error(
+      [
+        "Multiple API key flags were provided for non-interactive onboarding.",
+        "Use a single provider flag or pass --auth-choice explicitly.",
+        `Flags: ${inferredAuthChoice.matches.map((match) => match.label).join(", ")}`,
+      ].join("\n"),
+    );
+    runtime.exit(1);
+    return;
+  }
+  const authChoice = opts.authChoice ?? inferredAuthChoice.choice ?? "skip";
   const nextConfigAfterAuth = await applyNonInteractiveAuthChoice({
     nextConfig,
     authChoice,
@@ -55,7 +70,9 @@ export async function runNonInteractiveOnboardingLocal(params: {
     runtime,
     baseConfig,
   });
-  if (!nextConfigAfterAuth) return;
+  if (!nextConfigAfterAuth) {
+    return;
+  }
   nextConfig = nextConfigAfterAuth;
 
   const gatewayBasePort = resolveGatewayPort(baseConfig);
@@ -65,14 +82,16 @@ export async function runNonInteractiveOnboardingLocal(params: {
     runtime,
     defaultPort: gatewayBasePort,
   });
-  if (!gatewayResult) return;
+  if (!gatewayResult) {
+    return;
+  }
   nextConfig = gatewayResult.nextConfig;
 
   nextConfig = applyNonInteractiveSkillsConfig({ nextConfig, opts, runtime });
 
   nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
   await writeConfigFile(nextConfig);
-  runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
+  logConfigUpdated(runtime);
 
   await ensureWorkspaceAndSessions(workspaceDir, runtime, {
     skipBootstrap: Boolean(nextConfig.agents?.defaults?.skipBootstrap),
@@ -88,8 +107,17 @@ export async function runNonInteractiveOnboardingLocal(params: {
 
   const daemonRuntimeRaw = opts.daemonRuntime ?? DEFAULT_GATEWAY_DAEMON_RUNTIME;
   if (!opts.skipHealth) {
-    await sleep(1000);
-    // Health check runs against the gateway; small delay avoids flakiness during install/start.
+    const links = resolveControlUiLinks({
+      bind: gatewayResult.bind as "auto" | "lan" | "loopback" | "custom" | "tailnet",
+      port: gatewayResult.port,
+      customBindHost: nextConfig.gateway?.customBindHost,
+      basePath: undefined,
+    });
+    await waitForGatewayReachable({
+      url: links.wsUrl,
+      token: gatewayResult.gatewayToken,
+      deadlineMs: 15_000,
+    });
     await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
   }
 
@@ -113,7 +141,7 @@ export async function runNonInteractiveOnboardingLocal(params: {
 
   if (!opts.json) {
     runtime.log(
-      "Tip: run `clawdbot configure --section web` to store your Brave API key for web_search. Docs: https://docs.clawd.bot/tools/web",
+      `Tip: run \`${formatCliCommand("openclaw configure --section web")}\` to store your Brave API key for web_search. Docs: https://docs.openclaw.ai/tools/web`,
     );
   }
 }

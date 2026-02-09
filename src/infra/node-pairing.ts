@@ -9,6 +9,8 @@ export type NodePairingPendingRequest = {
   displayName?: string;
   platform?: string;
   version?: string;
+  coreVersion?: string;
+  uiVersion?: string;
   deviceFamily?: string;
   modelIdentifier?: string;
   caps?: string[];
@@ -26,14 +28,18 @@ export type NodePairingPairedNode = {
   displayName?: string;
   platform?: string;
   version?: string;
+  coreVersion?: string;
+  uiVersion?: string;
   deviceFamily?: string;
   modelIdentifier?: string;
   caps?: string[];
   commands?: string[];
+  bins?: string[];
   permissions?: Record<string, boolean>;
   remoteIp?: string;
   createdAtMs: number;
   approvedAtMs: number;
+  lastConnectedAtMs?: number;
 };
 
 export type NodePairingList = {
@@ -72,7 +78,17 @@ async function writeJSONAtomic(filePath: string, value: unknown) {
   await fs.mkdir(dir, { recursive: true });
   const tmp = `${filePath}.${randomUUID()}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
+  try {
+    await fs.chmod(tmp, 0o600);
+  } catch {
+    // best-effort; ignore on platforms without chmod
+  }
   await fs.rename(tmp, filePath);
+  try {
+    await fs.chmod(filePath, 0o600);
+  } catch {
+    // best-effort; ignore on platforms without chmod
+  }
 }
 
 function pruneExpiredPending(
@@ -133,8 +149,8 @@ function newToken() {
 
 export async function listNodePairing(baseDir?: string): Promise<NodePairingList> {
   const state = await loadState(baseDir);
-  const pending = Object.values(state.pendingById).sort((a, b) => b.ts - a.ts);
-  const paired = Object.values(state.pairedByNodeId).sort(
+  const pending = Object.values(state.pendingById).toSorted((a, b) => b.ts - a.ts);
+  const paired = Object.values(state.pairedByNodeId).toSorted(
     (a, b) => b.approvedAtMs - a.approvedAtMs,
   );
   return { pending, paired };
@@ -175,6 +191,8 @@ export async function requestNodePairing(
       displayName: req.displayName,
       platform: req.platform,
       version: req.version,
+      coreVersion: req.coreVersion,
+      uiVersion: req.uiVersion,
       deviceFamily: req.deviceFamily,
       modelIdentifier: req.modelIdentifier,
       caps: req.caps,
@@ -198,7 +216,9 @@ export async function approveNodePairing(
   return await withLock(async () => {
     const state = await loadState(baseDir);
     const pending = state.pendingById[requestId];
-    if (!pending) return null;
+    if (!pending) {
+      return null;
+    }
 
     const now = Date.now();
     const existing = state.pairedByNodeId[pending.nodeId];
@@ -208,6 +228,8 @@ export async function approveNodePairing(
       displayName: pending.displayName,
       platform: pending.platform,
       version: pending.version,
+      coreVersion: pending.coreVersion,
+      uiVersion: pending.uiVersion,
       deviceFamily: pending.deviceFamily,
       modelIdentifier: pending.modelIdentifier,
       caps: pending.caps,
@@ -232,7 +254,9 @@ export async function rejectNodePairing(
   return await withLock(async () => {
     const state = await loadState(baseDir);
     const pending = state.pendingById[requestId];
-    if (!pending) return null;
+    if (!pending) {
+      return null;
+    }
     delete state.pendingById[requestId];
     await persistState(state, baseDir);
     return { requestId, nodeId: pending.nodeId };
@@ -247,7 +271,9 @@ export async function verifyNodeToken(
   const state = await loadState(baseDir);
   const normalized = normalizeNodeId(nodeId);
   const node = state.pairedByNodeId[normalized];
-  if (!node) return { ok: false };
+  if (!node) {
+    return { ok: false };
+  }
   return node.token === token ? { ok: true, node } : { ok: false };
 }
 
@@ -260,19 +286,25 @@ export async function updatePairedNodeMetadata(
     const state = await loadState(baseDir);
     const normalized = normalizeNodeId(nodeId);
     const existing = state.pairedByNodeId[normalized];
-    if (!existing) return;
+    if (!existing) {
+      return;
+    }
 
     const next: NodePairingPairedNode = {
       ...existing,
       displayName: patch.displayName ?? existing.displayName,
       platform: patch.platform ?? existing.platform,
       version: patch.version ?? existing.version,
+      coreVersion: patch.coreVersion ?? existing.coreVersion,
+      uiVersion: patch.uiVersion ?? existing.uiVersion,
       deviceFamily: patch.deviceFamily ?? existing.deviceFamily,
       modelIdentifier: patch.modelIdentifier ?? existing.modelIdentifier,
       remoteIp: patch.remoteIp ?? existing.remoteIp,
       caps: patch.caps ?? existing.caps,
       commands: patch.commands ?? existing.commands,
+      bins: patch.bins ?? existing.bins,
       permissions: patch.permissions ?? existing.permissions,
+      lastConnectedAtMs: patch.lastConnectedAtMs ?? existing.lastConnectedAtMs,
     };
 
     state.pairedByNodeId[normalized] = next;
@@ -289,9 +321,13 @@ export async function renamePairedNode(
     const state = await loadState(baseDir);
     const normalized = normalizeNodeId(nodeId);
     const existing = state.pairedByNodeId[normalized];
-    if (!existing) return null;
+    if (!existing) {
+      return null;
+    }
     const trimmed = displayName.trim();
-    if (!trimmed) throw new Error("displayName required");
+    if (!trimmed) {
+      throw new Error("displayName required");
+    }
     const next: NodePairingPairedNode = { ...existing, displayName: trimmed };
     state.pairedByNodeId[normalized] = next;
     await persistState(state, baseDir);

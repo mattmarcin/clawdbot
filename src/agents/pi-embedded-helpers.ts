@@ -6,30 +6,36 @@ export {
   stripThoughtSignatures,
 } from "./pi-embedded-helpers/bootstrap.js";
 export {
+  BILLING_ERROR_USER_MESSAGE,
   classifyFailoverReason,
+  formatRawAssistantErrorForUi,
   formatAssistantErrorText,
   getApiErrorPayloadFingerprint,
   isAuthAssistantError,
   isAuthErrorMessage,
   isBillingAssistantError,
+  parseApiErrorInfo,
+  sanitizeUserFacingText,
   isBillingErrorMessage,
   isCloudCodeAssistFormatError,
   isCompactionFailureError,
   isContextOverflowError,
+  isLikelyContextOverflowError,
   isFailoverAssistantError,
   isFailoverErrorMessage,
+  isImageDimensionErrorMessage,
+  isImageSizeError,
   isOverloadedErrorMessage,
   isRawApiErrorPayload,
   isRateLimitAssistantError,
   isRateLimitErrorMessage,
   isTimeoutErrorMessage,
+  parseImageDimensionError,
+  parseImageSizeError,
 } from "./pi-embedded-helpers/errors.js";
-export {
-  downgradeGeminiHistory,
-  downgradeGeminiThinkingBlocks,
-  isGoogleModelApi,
-  sanitizeGoogleTurnOrdering,
-} from "./pi-embedded-helpers/google.js";
+export { isGoogleModelApi, sanitizeGoogleTurnOrdering } from "./pi-embedded-helpers/google.js";
+
+export { downgradeOpenAIReasoningBlocks } from "./pi-embedded-helpers/openai.js";
 export {
   isEmptyAssistantMessageContent,
   sanitizeSessionMessagesImages,
@@ -49,4 +55,5 @@ export {
 } from "./pi-embedded-helpers/turns.js";
 export type { EmbeddedContextFile, FailoverReason } from "./pi-embedded-helpers/types.js";
 
+export type { ToolCallIdMode } from "./tool-call-id.js";
 export { isValidCloudCodeAssistToolId, sanitizeToolCallId } from "./tool-call-id.js";

@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
-
-import type { ClawdbotConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import type { TemplateContext } from "../templating.js";
 import { buildThreadingToolContext } from "./agent-runner-utils.js";
 
 describe("buildThreadingToolContext", () => {
-  const cfg = {} as ClawdbotConfig;
+  const cfg = {} as OpenClawConfig;
 
   it("uses conversation id for WhatsApp", () => {
     const sessionCtx = {
@@ -52,5 +51,56 @@ describe("buildThreadingToolContext", () => {
     });
 
     expect(result.currentChannelId).toBe("chat:99");
+  });
+
+  it("uses the sender handle for iMessage direct chats", () => {
+    const sessionCtx = {
+      Provider: "imessage",
+      ChatType: "direct",
+      From: "imessage:+15550001",
+      To: "chat_id:12",
+    } as TemplateContext;
+
+    const result = buildThreadingToolContext({
+      sessionCtx,
+      config: cfg,
+      hasRepliedRef: undefined,
+    });
+
+    expect(result.currentChannelId).toBe("imessage:+15550001");
+  });
+
+  it("uses chat_id for iMessage groups", () => {
+    const sessionCtx = {
+      Provider: "imessage",
+      ChatType: "group",
+      From: "imessage:group:7",
+      To: "chat_id:7",
+    } as TemplateContext;
+
+    const result = buildThreadingToolContext({
+      sessionCtx,
+      config: cfg,
+      hasRepliedRef: undefined,
+    });
+
+    expect(result.currentChannelId).toBe("chat_id:7");
+  });
+
+  it("prefers MessageThreadId for Slack tool threading", () => {
+    const sessionCtx = {
+      Provider: "slack",
+      To: "channel:C1",
+      MessageThreadId: "123.456",
+    } as TemplateContext;
+
+    const result = buildThreadingToolContext({
+      sessionCtx,
+      config: { channels: { slack: { replyToMode: "all" } } } as OpenClawConfig,
+      hasRepliedRef: undefined,
+    });
+
+    expect(result.currentChannelId).toBe("C1");
+    expect(result.currentThreadTs).toBe("123.456");
   });
 });

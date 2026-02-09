@@ -1,41 +1,54 @@
 import crypto from "node:crypto";
 import path from "node:path";
-
+import { resolveQueueSettings } from "../auto-reply/reply/queue.js";
 import { loadConfig } from "../config/config.js";
 import {
   loadSessionStore,
   resolveAgentIdFromSessionKey,
+  resolveMainSessionKey,
   resolveStorePath,
 } from "../config/sessions.js";
 import { callGateway } from "../gateway/call.js";
-import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel.js";
-import { AGENT_LANE_NESTED } from "./lanes.js";
-import { readLatestAssistantReply, runAgentStep } from "./tools/agent-step.js";
-import { resolveAnnounceTarget } from "./tools/sessions-announce-target.js";
-import { isAnnounceSkip } from "./tools/sessions-send-helpers.js";
-
-function formatDurationShort(valueMs?: number) {
-  if (!valueMs || !Number.isFinite(valueMs) || valueMs <= 0) return undefined;
-  const totalSeconds = Math.round(valueMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) return `${hours}h${minutes}m`;
-  if (minutes > 0) return `${minutes}m${seconds}s`;
-  return `${seconds}s`;
-}
+import { formatDurationCompact } from "../infra/format-time/format-duration.ts";
+import { normalizeMainKey } from "../routing/session-key.js";
+import { defaultRuntime } from "../runtime.js";
+import {
+  type DeliveryContext,
+  deliveryContextFromSession,
+  mergeDeliveryContext,
+  normalizeDeliveryContext,
+} from "../utils/delivery-context.js";
+import {
+  isEmbeddedPiRunActive,
+  queueEmbeddedPiMessage,
+  waitForEmbeddedPiRunEnd,
+} from "./pi-embedded.js";
+import { type AnnounceQueueItem, enqueueAnnounce } from "./subagent-announce-queue.js";
+import { readLatestAssistantReply } from "./tools/agent-step.js";
 
 function formatTokenCount(value?: number) {
-  if (!value || !Number.isFinite(value)) return "0";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  if (!value || !Number.isFinite(value)) {
+    return "0";
+  }
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(1)}m`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(1)}k`;
+  }
   return String(Math.round(value));
 }
 
 function formatUsd(value?: number) {
-  if (value === undefined || !Number.isFinite(value)) return undefined;
-  if (value >= 1) return `$${value.toFixed(2)}`;
-  if (value >= 0.01) return `$${value.toFixed(2)}`;
+  if (value === undefined || !Number.isFinite(value)) {
+    return undefined;
+  }
+  if (value >= 1) {
+    return `$${value.toFixed(2)}`;
+  }
+  if (value >= 0.01) {
+    return `$${value.toFixed(2)}`;
+  }
   return `$${value.toFixed(4)}`;
 }
 
@@ -53,7 +66,9 @@ function resolveModelCost(params: {
   | undefined {
   const provider = params.provider?.trim();
   const model = params.model?.trim();
-  if (!provider || !model) return undefined;
+  if (!provider || !model) {
+    return undefined;
+  }
   const models = params.config.models?.providers?.[provider]?.models ?? [];
   const entry = models.find((candidate) => candidate.id === model);
   return entry?.cost;
@@ -64,19 +79,143 @@ async function waitForSessionUsage(params: { sessionKey: string }) {
   const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
   const storePath = resolveStorePath(cfg.session?.store, { agentId });
   let entry = loadSessionStore(storePath)[params.sessionKey];
-  if (!entry) return { entry, storePath };
+  if (!entry) {
+    return { entry, storePath };
+  }
   const hasTokens = () =>
     entry &&
     (typeof entry.totalTokens === "number" ||
       typeof entry.inputTokens === "number" ||
       typeof entry.outputTokens === "number");
-  if (hasTokens()) return { entry, storePath };
+  if (hasTokens()) {
+    return { entry, storePath };
+  }
   for (let attempt = 0; attempt < 4; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 200));
     entry = loadSessionStore(storePath)[params.sessionKey];
-    if (hasTokens()) break;
+    if (hasTokens()) {
+      break;
+    }
   }
   return { entry, storePath };
+}
+
+type DeliveryContextSource = Parameters<typeof deliveryContextFromSession>[0];
+
+function resolveAnnounceOrigin(
+  entry?: DeliveryContextSource,
+  requesterOrigin?: DeliveryContext,
+): DeliveryContext | undefined {
+  // requesterOrigin (captured at spawn time) reflects the channel the user is
+  // actually on and must take priority over the session entry, which may carry
+  // stale lastChannel / lastTo values from a previous channel interaction.
+  return mergeDeliveryContext(requesterOrigin, deliveryContextFromSession(entry));
+}
+
+async function sendAnnounce(item: AnnounceQueueItem) {
+  const origin = item.origin;
+  const threadId =
+    origin?.threadId != null && origin.threadId !== "" ? String(origin.threadId) : undefined;
+  await callGateway({
+    method: "agent",
+    params: {
+      sessionKey: item.sessionKey,
+      message: item.prompt,
+      channel: origin?.channel,
+      accountId: origin?.accountId,
+      to: origin?.to,
+      threadId,
+      deliver: true,
+      idempotencyKey: crypto.randomUUID(),
+    },
+    expectFinal: true,
+    timeoutMs: 60_000,
+  });
+}
+
+function resolveRequesterStoreKey(
+  cfg: ReturnType<typeof loadConfig>,
+  requesterSessionKey: string,
+): string {
+  const raw = requesterSessionKey.trim();
+  if (!raw) {
+    return raw;
+  }
+  if (raw === "global" || raw === "unknown") {
+    return raw;
+  }
+  if (raw.startsWith("agent:")) {
+    return raw;
+  }
+  const mainKey = normalizeMainKey(cfg.session?.mainKey);
+  if (raw === "main" || raw === mainKey) {
+    return resolveMainSessionKey(cfg);
+  }
+  const agentId = resolveAgentIdFromSessionKey(raw);
+  return `agent:${agentId}:${raw}`;
+}
+
+function loadRequesterSessionEntry(requesterSessionKey: string) {
+  const cfg = loadConfig();
+  const canonicalKey = resolveRequesterStoreKey(cfg, requesterSessionKey);
+  const agentId = resolveAgentIdFromSessionKey(canonicalKey);
+  const storePath = resolveStorePath(cfg.session?.store, { agentId });
+  const store = loadSessionStore(storePath);
+  const entry = store[canonicalKey];
+  return { cfg, entry, canonicalKey };
+}
+
+async function maybeQueueSubagentAnnounce(params: {
+  requesterSessionKey: string;
+  triggerMessage: string;
+  summaryLine?: string;
+  requesterOrigin?: DeliveryContext;
+}): Promise<"steered" | "queued" | "none"> {
+  const { cfg, entry } = loadRequesterSessionEntry(params.requesterSessionKey);
+  const canonicalKey = resolveRequesterStoreKey(cfg, params.requesterSessionKey);
+  const sessionId = entry?.sessionId;
+  if (!sessionId) {
+    return "none";
+  }
+
+  const queueSettings = resolveQueueSettings({
+    cfg,
+    channel: entry?.channel ?? entry?.lastChannel,
+    sessionEntry: entry,
+  });
+  const isActive = isEmbeddedPiRunActive(sessionId);
+
+  const shouldSteer = queueSettings.mode === "steer" || queueSettings.mode === "steer-backlog";
+  if (shouldSteer) {
+    const steered = queueEmbeddedPiMessage(sessionId, params.triggerMessage);
+    if (steered) {
+      return "steered";
+    }
+  }
+
+  const shouldFollowup =
+    queueSettings.mode === "followup" ||
+    queueSettings.mode === "collect" ||
+    queueSettings.mode === "steer-backlog" ||
+    queueSettings.mode === "interrupt";
+  if (isActive && (shouldFollowup || queueSettings.mode === "steer")) {
+    const origin = resolveAnnounceOrigin(entry, params.requesterOrigin);
+    enqueueAnnounce({
+      key: canonicalKey,
+      item: {
+        prompt: params.triggerMessage,
+        summaryLine: params.summaryLine,
+        enqueuedAt: Date.now(),
+        sessionKey: canonicalKey,
+        origin,
+      },
+      settings: queueSettings,
+      send: sendAnnounce,
+    });
+    return "queued";
+  }
+
+  return "none";
 }
 
 async function buildSubagentStatsLine(params: {
@@ -112,7 +251,7 @@ async function buildSubagentStatsLine(params: {
       : undefined;
 
   const parts: string[] = [];
-  const runtime = formatDurationShort(runtimeMs);
+  const runtime = formatDurationCompact(runtimeMs);
   parts.push(`runtime ${runtime ?? "n/a"}`);
   if (typeof total === "number") {
     const inputText = typeof input === "number" ? formatTokenCount(input) : "n/a";
@@ -123,17 +262,52 @@ async function buildSubagentStatsLine(params: {
     parts.push("tokens n/a");
   }
   const costText = formatUsd(cost);
-  if (costText) parts.push(`est ${costText}`);
+  if (costText) {
+    parts.push(`est ${costText}`);
+  }
   parts.push(`sessionKey ${params.sessionKey}`);
-  if (sessionId) parts.push(`sessionId ${sessionId}`);
-  if (transcriptPath) parts.push(`transcript ${transcriptPath}`);
+  if (sessionId) {
+    parts.push(`sessionId ${sessionId}`);
+  }
+  if (transcriptPath) {
+    parts.push(`transcript ${transcriptPath}`);
+  }
 
   return `Stats: ${parts.join(" \u2022 ")}`;
 }
 
+function loadSessionEntryByKey(sessionKey: string) {
+  const cfg = loadConfig();
+  const agentId = resolveAgentIdFromSessionKey(sessionKey);
+  const storePath = resolveStorePath(cfg.session?.store, { agentId });
+  const store = loadSessionStore(storePath);
+  return store[sessionKey];
+}
+
+async function readLatestAssistantReplyWithRetry(params: {
+  sessionKey: string;
+  initialReply?: string;
+  maxWaitMs: number;
+}): Promise<string | undefined> {
+  let reply = params.initialReply?.trim() ? params.initialReply : undefined;
+  if (reply) {
+    return reply;
+  }
+
+  const deadline = Date.now() + Math.max(0, Math.min(params.maxWaitMs, 15_000));
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const latest = await readLatestAssistantReply({ sessionKey: params.sessionKey });
+    if (latest?.trim()) {
+      return latest;
+    }
+  }
+  return reply;
+}
+
 export function buildSubagentSystemPrompt(params: {
   requesterSessionKey?: string;
-  requesterChannel?: string;
+  requesterOrigin?: DeliveryContext;
   childSessionKey: string;
   label?: string;
   task?: string;
@@ -149,36 +323,36 @@ export function buildSubagentSystemPrompt(params: {
     "",
     "## Your Role",
     `- You were created to handle: ${taskText}`,
-    "- Complete this task and report back. That's your entire purpose.",
+    "- Complete this task. That's your entire purpose.",
     "- You are NOT the main agent. Don't try to be.",
     "",
     "## Rules",
     "1. **Stay focused** - Do your assigned task, nothing else",
-    "2. **Report completion** - When done, summarize results clearly",
+    "2. **Complete the task** - Your final message will be automatically reported to the main agent",
     "3. **Don't initiate** - No heartbeats, no proactive actions, no side quests",
-    "4. **Ask the spawner** - If blocked or confused, report back rather than improvising",
-    "5. **Be ephemeral** - You may be terminated after task completion. That's fine.",
+    "4. **Be ephemeral** - You may be terminated after task completion. That's fine.",
+    "",
+    "## Output Format",
+    "When complete, your final response should include:",
+    "- What you accomplished or found",
+    "- Any relevant details the main agent should know",
+    "- Keep it concise but informative",
     "",
     "## What You DON'T Do",
     "- NO user conversations (that's main agent's job)",
-    "- NO external messages (email, tweets, etc.) unless explicitly tasked",
+    "- NO external messages (email, tweets, etc.) unless explicitly tasked with a specific recipient/channel",
     "- NO cron jobs or persistent state",
     "- NO pretending to be the main agent",
-    "",
-    "## Output Format",
-    "When complete, respond with:",
-    "- **Status:** success | failed | blocked",
-    "- **Result:** [what you accomplished]",
-    "- **Notes:** [anything the main agent should know] - discuss gimme options",
+    "- Only use the `message` tool when explicitly instructed to contact a specific external recipient; otherwise return plain text and let the main agent deliver it",
     "",
     "## Session Context",
     params.label ? `- Label: ${params.label}` : undefined,
     params.requesterSessionKey ? `- Requester session: ${params.requesterSessionKey}.` : undefined,
-    params.requesterChannel ? `- Requester channel: ${params.requesterChannel}.` : undefined,
+    params.requesterOrigin?.channel
+      ? `- Requester channel: ${params.requesterOrigin.channel}.`
+      : undefined,
     `- Your session: ${params.childSessionKey}.`,
     "",
-    "Run the task. Provide a clear final answer (plain text).",
-    'After you finish, you may be asked to produce an "announce" message to post back to the requester chat.',
   ].filter((line): line is string => line !== undefined);
   return lines.join("\n");
 }
@@ -188,114 +362,13 @@ export type SubagentRunOutcome = {
   error?: string;
 };
 
-const ANNOUNCE_SECTION_RE = /^\s*[-*]?\s*(?:\*\*)?(status|result|notes)(?:\*\*)?\s*:\s*(.*)$/i;
-
-function parseAnnounceSections(announce: string) {
-  const sections = {
-    status: [] as string[],
-    result: [] as string[],
-    notes: [] as string[],
-  };
-  let current: keyof typeof sections | null = null;
-  let sawSection = false;
-
-  for (const line of announce.split(/\r?\n/)) {
-    const match = line.match(ANNOUNCE_SECTION_RE);
-    if (match) {
-      const key = match[1]?.toLowerCase() as keyof typeof sections;
-      current = key;
-      sawSection = true;
-      const rest = match[2]?.trim();
-      if (rest) sections[key].push(rest);
-      continue;
-    }
-    if (current) sections[current].push(line);
-  }
-
-  const normalize = (lines: string[]) => {
-    const joined = lines.join("\n").trim();
-    return joined.length > 0 ? joined : undefined;
-  };
-
-  return {
-    sawSection,
-    status: normalize(sections.status),
-    result: normalize(sections.result),
-    notes: normalize(sections.notes),
-  };
-}
-
-function normalizeAnnounceBody(params: {
-  outcome: SubagentRunOutcome;
-  announceReply: string;
-  statsLine?: string;
-}) {
-  const announce = params.announceReply.trim();
-  const statsLine = params.statsLine?.trim();
-
-  const statusLabel =
-    params.outcome.status === "ok"
-      ? "success"
-      : params.outcome.status === "timeout"
-        ? "timeout"
-        : params.outcome.status === "unknown"
-          ? "unknown"
-          : "error";
-
-  const parsed = parseAnnounceSections(announce);
-  const resultText = parsed.result ?? (announce || "(not available)");
-  const notesParts: string[] = [];
-  if (parsed.notes) notesParts.push(parsed.notes);
-  if (params.outcome.error) notesParts.push(`- Error: ${params.outcome.error}`);
-  const notesBlock = notesParts.length ? notesParts.join("\n") : "- (none)";
-
-  const message = [
-    `Status: ${statusLabel}`,
-    "",
-    "Result:",
-    resultText,
-    "",
-    "Notes:",
-    notesBlock,
-  ].join("\n");
-
-  return statsLine ? `${message}\n\n${statsLine}` : message;
-}
-
-function buildSubagentAnnouncePrompt(params: {
-  requesterSessionKey?: string;
-  requesterChannel?: string;
-  announceChannel: string;
-  task: string;
-  subagentReply?: string;
-}) {
-  const lines = [
-    "Sub-agent announce step:",
-    params.requesterSessionKey ? `Requester session: ${params.requesterSessionKey}.` : undefined,
-    params.requesterChannel ? `Requester channel: ${params.requesterChannel}.` : undefined,
-    `Post target channel: ${params.announceChannel}.`,
-    `Original task: ${params.task}`,
-    params.subagentReply
-      ? `Sub-agent result: ${params.subagentReply}`
-      : "Sub-agent result: (not available).",
-    "",
-    "**You MUST announce your result.** The requester is waiting for your response.",
-    "Provide a brief, useful summary of what you accomplished.",
-    "Reply with Result and Notes only (no Status line; status is added by the system).",
-    "Format:",
-    "Result: <summary>",
-    "Notes: <extra context>",
-    'Only reply "ANNOUNCE_SKIP" if the task completely failed with no useful output.',
-    "Your reply will be posted to the requester chat.",
-  ].filter(Boolean);
-  return lines.join("\n");
-}
+export type SubagentAnnounceType = "subagent task" | "cron job";
 
 export async function runSubagentAnnounceFlow(params: {
   childSessionKey: string;
   childRunId: string;
   requesterSessionKey: string;
-  requesterChannel?: string;
+  requesterOrigin?: DeliveryContext;
   requesterDisplayKey: string;
   task: string;
   timeoutMs: number;
@@ -306,30 +379,54 @@ export async function runSubagentAnnounceFlow(params: {
   endedAt?: number;
   label?: string;
   outcome?: SubagentRunOutcome;
+  announceType?: SubagentAnnounceType;
 }): Promise<boolean> {
   let didAnnounce = false;
+  let shouldDeleteChildSession = params.cleanup === "delete";
   try {
+    const requesterOrigin = normalizeDeliveryContext(params.requesterOrigin);
+    const childSessionId = (() => {
+      const entry = loadSessionEntryByKey(params.childSessionKey);
+      return typeof entry?.sessionId === "string" && entry.sessionId.trim()
+        ? entry.sessionId.trim()
+        : undefined;
+    })();
+    const settleTimeoutMs = Math.min(Math.max(params.timeoutMs, 1), 120_000);
     let reply = params.roundOneReply;
     let outcome: SubagentRunOutcome | undefined = params.outcome;
+    // Lifecycle "end" can arrive before auto-compaction retries finish. If the
+    // subagent is still active, wait for the embedded run to fully settle.
+    if (childSessionId && isEmbeddedPiRunActive(childSessionId)) {
+      const settled = await waitForEmbeddedPiRunEnd(childSessionId, settleTimeoutMs);
+      if (!settled && isEmbeddedPiRunActive(childSessionId)) {
+        // The child run is still active (e.g., compaction retry still in progress).
+        // Defer announcement so we don't report stale/partial output.
+        // Keep the child session so output is not lost while the run is still active.
+        shouldDeleteChildSession = false;
+        return false;
+      }
+    }
+
     if (!reply && params.waitForCompletion !== false) {
-      const waitMs = Math.min(params.timeoutMs, 60_000);
-      const wait = (await callGateway({
+      const waitMs = settleTimeoutMs;
+      const wait = await callGateway<{
+        status?: string;
+        startedAt?: number;
+        endedAt?: number;
+        error?: string;
+      }>({
         method: "agent.wait",
         params: {
           runId: params.childRunId,
           timeoutMs: waitMs,
         },
         timeoutMs: waitMs + 2000,
-      })) as {
-        status?: string;
-        error?: string;
-        startedAt?: number;
-        endedAt?: number;
-      };
+      });
+      const waitError = typeof wait?.error === "string" ? wait.error : undefined;
       if (wait?.status === "timeout") {
         outcome = { status: "timeout" };
       } else if (wait?.status === "error") {
-        outcome = { status: "error", error: wait.error };
+        outcome = { status: "error", error: waitError };
       } else if (wait?.status === "ok") {
         outcome = { status: "ok" };
       }
@@ -340,72 +437,111 @@ export async function runSubagentAnnounceFlow(params: {
         params.endedAt = wait.endedAt;
       }
       if (wait?.status === "timeout") {
-        // No lifecycle end seen before timeout. Still attempt an announce so
-        // requesters are not left hanging.
-        if (!outcome) outcome = { status: "timeout" };
+        if (!outcome) {
+          outcome = { status: "timeout" };
+        }
       }
-      reply = await readLatestAssistantReply({
-        sessionKey: params.childSessionKey,
-      });
+      reply = await readLatestAssistantReply({ sessionKey: params.childSessionKey });
     }
 
     if (!reply) {
-      reply = await readLatestAssistantReply({
+      reply = await readLatestAssistantReply({ sessionKey: params.childSessionKey });
+    }
+
+    if (!reply?.trim()) {
+      reply = await readLatestAssistantReplyWithRetry({
         sessionKey: params.childSessionKey,
+        initialReply: reply,
+        maxWaitMs: params.timeoutMs,
       });
     }
 
-    if (!outcome) outcome = { status: "unknown" };
+    if (!reply?.trim() && childSessionId && isEmbeddedPiRunActive(childSessionId)) {
+      // Avoid announcing "(no output)" while the child run is still producing output.
+      shouldDeleteChildSession = false;
+      return false;
+    }
 
-    const announceTarget = await resolveAnnounceTarget({
-      sessionKey: params.requesterSessionKey,
-      displayKey: params.requesterDisplayKey,
-    });
-    if (!announceTarget) return false;
+    if (!outcome) {
+      outcome = { status: "unknown" };
+    }
 
-    const announcePrompt = buildSubagentAnnouncePrompt({
-      requesterSessionKey: params.requesterSessionKey,
-      requesterChannel: params.requesterChannel,
-      announceChannel: announceTarget.channel,
-      task: params.task,
-      subagentReply: reply,
-    });
-
-    const announceReply = await runAgentStep({
-      sessionKey: params.childSessionKey,
-      message: "Sub-agent announce step.",
-      extraSystemPrompt: announcePrompt,
-      timeoutMs: params.timeoutMs,
-      channel: INTERNAL_MESSAGE_CHANNEL,
-      lane: AGENT_LANE_NESTED,
-    });
-
-    if (!announceReply || !announceReply.trim() || isAnnounceSkip(announceReply)) return false;
-
+    // Build stats
     const statsLine = await buildSubagentStatsLine({
       sessionKey: params.childSessionKey,
       startedAt: params.startedAt,
       endedAt: params.endedAt,
     });
-    const message = normalizeAnnounceBody({
-      outcome,
-      announceReply,
-      statsLine,
-    });
 
+    // Build status label
+    const statusLabel =
+      outcome.status === "ok"
+        ? "completed successfully"
+        : outcome.status === "timeout"
+          ? "timed out"
+          : outcome.status === "error"
+            ? `failed: ${outcome.error || "unknown error"}`
+            : "finished with unknown status";
+
+    // Build instructional message for main agent
+    const announceType = params.announceType ?? "subagent task";
+    const taskLabel = params.label || params.task || "task";
+    const triggerMessage = [
+      `A ${announceType} "${taskLabel}" just ${statusLabel}.`,
+      "",
+      "Findings:",
+      reply || "(no output)",
+      "",
+      statsLine,
+      "",
+      "Summarize this naturally for the user. Keep it brief (1-2 sentences). Flow it into the conversation naturally.",
+      `Do not mention technical details like tokens, stats, or that this was a ${announceType}.`,
+      "You can respond with NO_REPLY if no announcement is needed (e.g., internal task with no user-facing result).",
+    ].join("\n");
+
+    const queued = await maybeQueueSubagentAnnounce({
+      requesterSessionKey: params.requesterSessionKey,
+      triggerMessage,
+      summaryLine: taskLabel,
+      requesterOrigin,
+    });
+    if (queued === "steered") {
+      didAnnounce = true;
+      return true;
+    }
+    if (queued === "queued") {
+      didAnnounce = true;
+      return true;
+    }
+
+    // Send to main agent - it will respond in its own voice
+    let directOrigin = requesterOrigin;
+    if (!directOrigin) {
+      const { entry } = loadRequesterSessionEntry(params.requesterSessionKey);
+      directOrigin = deliveryContextFromSession(entry);
+    }
     await callGateway({
-      method: "send",
+      method: "agent",
       params: {
-        to: announceTarget.to,
-        message,
-        channel: announceTarget.channel,
-        accountId: announceTarget.accountId,
+        sessionKey: params.requesterSessionKey,
+        message: triggerMessage,
+        deliver: true,
+        channel: directOrigin?.channel,
+        accountId: directOrigin?.accountId,
+        to: directOrigin?.to,
+        threadId:
+          directOrigin?.threadId != null && directOrigin.threadId !== ""
+            ? String(directOrigin.threadId)
+            : undefined,
         idempotencyKey: crypto.randomUUID(),
       },
-      timeoutMs: 10_000,
+      expectFinal: true,
+      timeoutMs: 60_000,
     });
+
     didAnnounce = true;
-  } catch {
+  } catch (err) {
+    defaultRuntime.error?.(`Subagent announce failed: ${String(err)}`);
     // Best-effort follow-ups; ignore failures to avoid breaking the caller response.
   } finally {
     // Patch label after all writes complete
@@ -420,7 +556,7 @@ export async function runSubagentAnnounceFlow(params: {
         // Best-effort
       }
     }
-    if (params.cleanup === "delete") {
+    if (shouldDeleteChildSession) {
       try {
         await callGateway({
           method: "sessions.delete",

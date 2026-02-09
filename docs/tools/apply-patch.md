@@ -3,6 +3,7 @@ summary: "Apply multi-file patches with the apply_patch tool"
 read_when:
   - You need structured file edits across multiple files
   - You want to document or debug patch-based edits
+title: "apply_patch Tool"
 ---
 
 # apply_patch tool
@@ -37,7 +38,7 @@ The tool accepts a single `input` string that wraps one or more file operations:
 - Experimental and disabled by default. Enable with `tools.exec.applyPatch.enabled`.
 - OpenAI-only (including OpenAI Codex). Optionally gate by model via
   `tools.exec.applyPatch.allowModels`.
-- Config is only under `tools.exec` (no `tools.bash` alias).
+- Config is only under `tools.exec`.
 
 ## Example
 

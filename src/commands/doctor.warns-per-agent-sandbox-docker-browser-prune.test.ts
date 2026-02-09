@@ -26,7 +26,7 @@ beforeEach(() => {
 
   readConfigFileSnapshot.mockReset();
   writeConfigFile.mockReset().mockResolvedValue(undefined);
-  resolveClawdbotPackageRoot.mockReset().mockResolvedValue(null);
+  resolveOpenClawPackageRoot.mockReset().mockResolvedValue(null);
   runGatewayUpdate.mockReset().mockResolvedValue({
     status: "skipped",
     mode: "unknown",
@@ -34,7 +34,7 @@ beforeEach(() => {
     durationMs: 0,
   });
   legacyReadConfigFileSnapshot.mockReset().mockResolvedValue({
-    path: "/tmp/clawdbot.json",
+    path: "/tmp/openclaw.json",
     exists: false,
     raw: null,
     parsed: {},
@@ -75,11 +75,11 @@ beforeEach(() => {
 
   originalIsTTY = process.stdin.isTTY;
   setStdinTty(true);
-  originalStateDir = process.env.CLAWDBOT_STATE_DIR;
-  originalUpdateInProgress = process.env.CLAWDBOT_UPDATE_IN_PROGRESS;
-  process.env.CLAWDBOT_UPDATE_IN_PROGRESS = "1";
-  tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-doctor-state-"));
-  process.env.CLAWDBOT_STATE_DIR = tempStateDir;
+  originalStateDir = process.env.OPENCLAW_STATE_DIR;
+  originalUpdateInProgress = process.env.OPENCLAW_UPDATE_IN_PROGRESS;
+  process.env.OPENCLAW_UPDATE_IN_PROGRESS = "1";
+  tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-doctor-state-"));
+  process.env.OPENCLAW_STATE_DIR = tempStateDir;
   fs.mkdirSync(path.join(tempStateDir, "agents", "main", "sessions"), {
     recursive: true,
   });
@@ -89,14 +89,14 @@ beforeEach(() => {
 afterEach(() => {
   setStdinTty(originalIsTTY);
   if (originalStateDir === undefined) {
-    delete process.env.CLAWDBOT_STATE_DIR;
+    delete process.env.OPENCLAW_STATE_DIR;
   } else {
-    process.env.CLAWDBOT_STATE_DIR = originalStateDir;
+    process.env.OPENCLAW_STATE_DIR = originalStateDir;
   }
   if (originalUpdateInProgress === undefined) {
-    delete process.env.CLAWDBOT_UPDATE_IN_PROGRESS;
+    delete process.env.OPENCLAW_UPDATE_IN_PROGRESS;
   } else {
-    process.env.CLAWDBOT_UPDATE_IN_PROGRESS = originalUpdateInProgress;
+    process.env.OPENCLAW_UPDATE_IN_PROGRESS = originalUpdateInProgress;
   }
   if (tempStateDir) {
     fs.rmSync(tempStateDir, { recursive: true, force: true });
@@ -109,7 +109,7 @@ const confirm = vi.fn().mockResolvedValue(true);
 const select = vi.fn().mockResolvedValue("node");
 const note = vi.fn();
 const writeConfigFile = vi.fn().mockResolvedValue(undefined);
-const resolveClawdbotPackageRoot = vi.fn().mockResolvedValue(null);
+const resolveOpenClawPackageRoot = vi.fn().mockResolvedValue(null);
 const runGatewayUpdate = vi.fn().mockResolvedValue({
   status: "skipped",
   mode: "unknown",
@@ -133,7 +133,7 @@ const runCommandWithTimeout = vi.fn().mockResolvedValue({
 const ensureAuthProfileStore = vi.fn().mockReturnValue({ version: 1, profiles: {} });
 
 const legacyReadConfigFileSnapshot = vi.fn().mockResolvedValue({
-  path: "/tmp/clawdbot.json",
+  path: "/tmp/openclaw.json",
   exists: false,
   raw: null,
   parsed: {},
@@ -172,11 +172,15 @@ vi.mock("../agents/skills-status.js", () => ({
   buildWorkspaceSkillStatus: () => ({ skills: [] }),
 }));
 
+vi.mock("../plugins/loader.js", () => ({
+  loadOpenClawPlugins: () => ({ plugins: [], diagnostics: [] }),
+}));
+
 vi.mock("../config/config.js", async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    CONFIG_PATH_CLAWDBOT: "/tmp/clawdbot.json",
+    CONFIG_PATH: "/tmp/openclaw.json",
     createConfigIO,
     readConfigFileSnapshot,
     writeConfigFile,
@@ -211,8 +215,8 @@ vi.mock("../process/exec.js", () => ({
   runCommandWithTimeout,
 }));
 
-vi.mock("../infra/clawdbot-root.js", () => ({
-  resolveClawdbotPackageRoot,
+vi.mock("../infra/openclaw-root.js", () => ({
+  resolveOpenClawPackageRoot,
 }));
 
 vi.mock("../infra/update-runner.js", () => ({
@@ -242,12 +246,9 @@ vi.mock("../daemon/service.js", () => ({
   }),
 }));
 
-vi.mock("../telegram/pairing-store.js", () => ({
-  readTelegramAllowFromStore: vi.fn().mockResolvedValue([]),
-}));
-
 vi.mock("../pairing/pairing-store.js", () => ({
   readChannelAllowFromStore: vi.fn().mockResolvedValue([]),
+  upsertChannelPairingRequest: vi.fn().mockResolvedValue({ code: "000000", created: false }),
 }));
 
 vi.mock("../telegram/token.js", () => ({
@@ -286,9 +287,16 @@ vi.mock("./onboard-helpers.js", () => ({
 }));
 
 vi.mock("./doctor-state-migrations.js", () => ({
+  autoMigrateLegacyStateDir: vi.fn().mockResolvedValue({
+    migrated: false,
+    skipped: false,
+    changes: [],
+    warnings: [],
+  }),
   detectLegacyStateMigrations: vi.fn().mockResolvedValue({
     targetAgentId: "main",
     targetMainKey: "main",
+    targetScope: undefined,
     stateDir: "/tmp/state",
     oauthDir: "/tmp/oauth",
     sessions: {
@@ -297,6 +305,7 @@ vi.mock("./doctor-state-migrations.js", () => ({
       targetDir: "/tmp/state/agents/main/sessions",
       targetStorePath: "/tmp/state/agents/main/sessions/sessions.json",
       hasLegacy: false,
+      legacyKeys: [],
     },
     agentDir: {
       legacyDir: "/tmp/state/agent",
@@ -319,7 +328,7 @@ vi.mock("./doctor-state-migrations.js", () => ({
 describe("doctor command", () => {
   it("warns when per-agent sandbox docker/browser/prune overrides are ignored under shared scope", async () => {
     readConfigFileSnapshot.mockResolvedValue({
-      path: "/tmp/clawdbot.json",
+      path: "/tmp/openclaw.json",
       exists: true,
       raw: "{}",
       parsed: {},
@@ -335,7 +344,7 @@ describe("doctor command", () => {
           list: [
             {
               id: "work",
-              workspace: "~/clawd-work",
+              workspace: "~/openclaw-work",
               sandbox: {
                 mode: "all",
                 scope: "shared",
@@ -364,7 +373,9 @@ describe("doctor command", () => {
 
     expect(
       note.mock.calls.some(([message, title]) => {
-        if (title !== "Sandbox" || typeof message !== "string") return false;
+        if (title !== "Sandbox" || typeof message !== "string") {
+          return false;
+        }
         const normalized = message.replace(/\s+/g, " ").trim();
         return (
           normalized.includes('agents.list (id "work") sandbox docker') &&
@@ -372,17 +383,17 @@ describe("doctor command", () => {
         );
       }),
     ).toBe(true);
-  }, 10_000);
+  }, 30_000);
 
-  it("warns when extra workspace directories exist", async () => {
+  it("does not warn when only the active workspace is present", async () => {
     readConfigFileSnapshot.mockResolvedValue({
-      path: "/tmp/clawdbot.json",
+      path: "/tmp/openclaw.json",
       exists: true,
       raw: "{}",
       parsed: {},
       valid: true,
       config: {
-        agents: { defaults: { workspace: "/Users/steipete/clawd" } },
+        agents: { defaults: { workspace: "/Users/steipete/openclaw" } },
       },
       issues: [],
       legacyIssues: [],
@@ -391,15 +402,16 @@ describe("doctor command", () => {
     note.mockClear();
     const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue("/Users/steipete");
     const realExists = fs.existsSync;
-    const legacyPath = path.join("/Users/steipete", "clawdbot");
+    const legacyPath = path.join("/Users/steipete", "openclaw");
     const legacyAgentsPath = path.join(legacyPath, "AGENTS.md");
     const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation((value) => {
       if (
-        value === "/Users/steipete/clawdbot" ||
+        value === "/Users/steipete/openclaw" ||
         value === legacyPath ||
         value === legacyAgentsPath
-      )
+      ) {
         return true;
+      }
       return realExists(value as never);
     });
 
@@ -412,14 +424,7 @@ describe("doctor command", () => {
 
     await doctorCommand(runtime, { nonInteractive: true });
 
-    expect(
-      note.mock.calls.some(
-        ([message, title]) =>
-          title === "Extra workspace" &&
-          typeof message === "string" &&
-          message.includes("clawdbot"),
-      ),
-    ).toBe(true);
+    expect(note.mock.calls.some(([_, title]) => title === "Extra workspace")).toBe(false);
 
     homedirSpy.mockRestore();
     existsSpy.mockRestore();

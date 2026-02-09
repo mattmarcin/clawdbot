@@ -1,6 +1,6 @@
-import path from "node:path";
 import { cancel, confirm, isCancel, multiselect } from "@clack/prompts";
-
+import path from "node:path";
+import type { RuntimeEnv } from "../runtime.js";
 import {
   isNixMode,
   loadConfig,
@@ -9,7 +9,6 @@ import {
   resolveStateDir,
 } from "../config/config.js";
 import { resolveGatewayService } from "../daemon/service.js";
-import type { RuntimeEnv } from "../runtime.js";
 import { stylePromptHint, stylePromptMessage, stylePromptTitle } from "../terminal/prompt-style.js";
 import { resolveHomeDir } from "../utils.js";
 import { collectWorkspaceDirs, isPathWithin, removePath } from "./cleanup-utils.js";
@@ -42,23 +41,30 @@ function buildScopeSelection(opts: UninstallOptions): {
 } {
   const hadExplicit = Boolean(opts.all || opts.service || opts.state || opts.workspace || opts.app);
   const scopes = new Set<UninstallScope>();
-  if (opts.all || opts.service) scopes.add("service");
-  if (opts.all || opts.state) scopes.add("state");
-  if (opts.all || opts.workspace) scopes.add("workspace");
-  if (opts.all || opts.app) scopes.add("app");
+  if (opts.all || opts.service) {
+    scopes.add("service");
+  }
+  if (opts.all || opts.state) {
+    scopes.add("state");
+  }
+  if (opts.all || opts.workspace) {
+    scopes.add("workspace");
+  }
+  if (opts.all || opts.app) {
+    scopes.add("app");
+  }
   return { scopes, hadExplicit };
 }
 
 async function stopAndUninstallService(runtime: RuntimeEnv): Promise<boolean> {
   if (isNixMode) {
-    runtime.error("Nix mode detected; daemon uninstall is disabled.");
+    runtime.error("Nix mode detected; service uninstall is disabled.");
     return false;
   }
   const service = resolveGatewayService();
-  const profile = process.env.CLAWDBOT_PROFILE;
   let loaded = false;
   try {
-    loaded = await service.isLoaded({ profile });
+    loaded = await service.isLoaded({ env: process.env });
   } catch (err) {
     runtime.error(`Gateway service check failed: ${String(err)}`);
     return false;
@@ -68,7 +74,7 @@ async function stopAndUninstallService(runtime: RuntimeEnv): Promise<boolean> {
     return true;
   }
   try {
-    await service.stop({ profile, stdout: process.stdout });
+    await service.stop({ env: process.env, stdout: process.stdout });
   } catch (err) {
     runtime.error(`Gateway stop failed: ${String(err)}`);
   }
@@ -82,10 +88,12 @@ async function stopAndUninstallService(runtime: RuntimeEnv): Promise<boolean> {
 }
 
 async function removeMacApp(runtime: RuntimeEnv, dryRun?: boolean) {
-  if (process.platform !== "darwin") return;
-  await removePath("/Applications/Clawdbot.app", runtime, {
+  if (process.platform !== "darwin") {
+    return;
+  }
+  await removePath("/Applications/OpenClaw.app", runtime, {
     dryRun,
-    label: "/Applications/Clawdbot.app",
+    label: "/Applications/OpenClaw.app",
   });
 }
 
@@ -112,12 +120,12 @@ export async function uninstallCommand(runtime: RuntimeEnv, opts: UninstallOptio
           label: "Gateway service",
           hint: "launchd / systemd / schtasks",
         },
-        { value: "state", label: "State + config", hint: "~/.clawdbot" },
+        { value: "state", label: "State + config", hint: "~/.openclaw" },
         { value: "workspace", label: "Workspace", hint: "agent files" },
         {
           value: "app",
           label: "macOS app",
-          hint: "/Applications/Clawdbot.app",
+          hint: "/Applications/OpenClaw.app",
         },
       ],
       initialValues: ["service", "state", "workspace"],
@@ -127,7 +135,9 @@ export async function uninstallCommand(runtime: RuntimeEnv, opts: UninstallOptio
       runtime.exit(0);
       return;
     }
-    for (const value of selection) scopes.add(value);
+    for (const value of selection) {
+      scopes.add(value);
+    }
   }
 
   if (scopes.size === 0) {

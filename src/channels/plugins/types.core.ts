@@ -1,9 +1,10 @@
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { TSchema } from "@sinclair/typebox";
 import type { MsgContext } from "../../auto-reply/templating.js";
-import type { ClawdbotConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import type { PollInput } from "../../polls.js";
 import type { GatewayClientMode, GatewayClientName } from "../../utils/message-channel.js";
+import type { ChatType } from "../chat-type.js";
 import type { ChatChannelId } from "../registry.js";
 import type { ChannelMessageActionName as ChannelMessageActionNameFromList } from "./message-action-names.js";
 
@@ -13,7 +14,7 @@ export type ChannelOutboundTargetMode = "explicit" | "implicit" | "heartbeat";
 
 export type ChannelAgentTool = AgentTool<TSchema, unknown>;
 
-export type ChannelAgentToolFactory = (params: { cfg?: ClawdbotConfig }) => ChannelAgentTool[];
+export type ChannelAgentToolFactory = (params: { cfg?: OpenClawConfig }) => ChannelAgentTool[];
 
 export type ChannelSetupInput = {
   name?: string;
@@ -30,7 +31,23 @@ export type ChannelSetupInput = {
   httpUrl?: string;
   httpHost?: string;
   httpPort?: string;
+  webhookPath?: string;
+  webhookUrl?: string;
+  audienceType?: string;
+  audience?: string;
   useEnv?: boolean;
+  homeserver?: string;
+  userId?: string;
+  accessToken?: string;
+  password?: string;
+  deviceName?: string;
+  initialSyncLimit?: number;
+  ship?: string;
+  url?: string;
+  code?: string;
+  groupChannels?: string[];
+  dmAllowlist?: string[];
+  autoDiscoverChannels?: boolean;
 };
 
 export type ChannelStatusIssue = {
@@ -66,10 +83,13 @@ export type ChannelMeta = {
   selectionDocsPrefix?: string;
   selectionDocsOmitLabel?: boolean;
   selectionExtras?: string[];
+  detailLabel?: string;
+  systemImage?: string;
   showConfigured?: boolean;
   quickstartAllowFrom?: boolean;
   forceAccountBinding?: boolean;
   preferSessionLookupForAnnounceTarget?: boolean;
+  preferOver?: string[];
 };
 
 export type ChannelAccountSnapshot = {
@@ -104,6 +124,12 @@ export type ChannelAccountSnapshot = {
   tokenSource?: string;
   botTokenSource?: string;
   appTokenSource?: string;
+  credentialSource?: string;
+  secretSource?: string;
+  audienceType?: string;
+  audience?: string;
+  webhookPath?: string;
+  webhookUrl?: string;
   baseUrl?: string;
   allowUnmentionedGroups?: boolean;
   cliPath?: string | null;
@@ -114,6 +140,10 @@ export type ChannelAccountSnapshot = {
   audit?: unknown;
   application?: unknown;
   bot?: unknown;
+  publicKey?: string | null;
+  profile?: unknown;
+  channelAccessToken?: string;
+  channelSecret?: string;
 };
 
 export type ChannelLogSink = {
@@ -124,17 +154,27 @@ export type ChannelLogSink = {
 };
 
 export type ChannelGroupContext = {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   groupId?: string | null;
-  groupRoom?: string | null;
+  /** Human label for channel-like group conversations (e.g. #general). */
+  groupChannel?: string | null;
   groupSpace?: string | null;
   accountId?: string | null;
+  senderId?: string | null;
+  senderName?: string | null;
+  senderUsername?: string | null;
+  senderE164?: string | null;
 };
 
 export type ChannelCapabilities = {
-  chatTypes: Array<"direct" | "group" | "channel" | "thread">;
+  chatTypes: Array<ChatType | "thread">;
   polls?: boolean;
   reactions?: boolean;
+  edit?: boolean;
+  unsend?: boolean;
+  reply?: boolean;
+  effects?: boolean;
+  groupManagement?: boolean;
   threads?: boolean;
   media?: boolean;
   nativeCommands?: boolean;
@@ -151,7 +191,7 @@ export type ChannelSecurityDmPolicy = {
 };
 
 export type ChannelSecurityContext<ResolvedAccount = unknown> = {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   accountId?: string | null;
   account: ResolvedAccount;
 };
@@ -159,13 +199,13 @@ export type ChannelSecurityContext<ResolvedAccount = unknown> = {
 export type ChannelMentionAdapter = {
   stripPatterns?: (params: {
     ctx: MsgContext;
-    cfg: ClawdbotConfig | undefined;
+    cfg: OpenClawConfig | undefined;
     agentId?: string;
   }) => string[];
   stripMentions?: (params: {
     text: string;
     ctx: MsgContext;
-    cfg: ClawdbotConfig | undefined;
+    cfg: OpenClawConfig | undefined;
     agentId?: string;
   }) => string;
 };
@@ -179,12 +219,13 @@ export type ChannelStreamingAdapter = {
 
 export type ChannelThreadingAdapter = {
   resolveReplyToMode?: (params: {
-    cfg: ClawdbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
+    chatType?: string | null;
   }) => "off" | "first" | "all";
   allowTagsWhenOff?: boolean;
   buildToolContext?: (params: {
-    cfg: ClawdbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
     context: ChannelThreadingContext;
     hasRepliedRef?: { value: boolean };
@@ -193,20 +234,56 @@ export type ChannelThreadingAdapter = {
 
 export type ChannelThreadingContext = {
   Channel?: string;
+  From?: string;
   To?: string;
+  ChatType?: string;
   ReplyToId?: string;
+  ReplyToIdFull?: string;
   ThreadLabel?: string;
+  MessageThreadId?: string | number;
 };
 
 export type ChannelThreadingToolContext = {
   currentChannelId?: string;
+  currentChannelProvider?: ChannelId;
   currentThreadTs?: string;
   replyToMode?: "off" | "first" | "all";
   hasRepliedRef?: { value: boolean };
+  /**
+   * When true, skip cross-context decoration (e.g., "[from X]" prefix).
+   * Use this for direct tool invocations where the agent is composing a new message,
+   * not forwarding/relaying a message from another conversation.
+   */
+  skipCrossContextDecoration?: boolean;
 };
 
 export type ChannelMessagingAdapter = {
   normalizeTarget?: (raw: string) => string | undefined;
+  targetResolver?: {
+    looksLikeId?: (raw: string, normalized?: string) => boolean;
+    hint?: string;
+  };
+  formatTargetDisplay?: (params: {
+    target: string;
+    display?: string;
+    kind?: ChannelDirectoryEntryKind;
+  }) => string;
+};
+
+export type ChannelAgentPromptAdapter = {
+  messageToolHints?: (params: { cfg: OpenClawConfig; accountId?: string | null }) => string[];
+};
+
+export type ChannelDirectoryEntryKind = "user" | "group" | "channel";
+
+export type ChannelDirectoryEntry = {
+  kind: ChannelDirectoryEntryKind;
+  id: string;
+  name?: string;
+  handle?: string;
+  avatarUrl?: string;
+  rank?: number;
+  raw?: unknown;
 };
 
 export type ChannelMessageActionName = ChannelMessageActionNameFromList;
@@ -214,7 +291,7 @@ export type ChannelMessageActionName = ChannelMessageActionNameFromList;
 export type ChannelMessageActionContext = {
   channel: ChannelId;
   action: ChannelMessageActionName;
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   params: Record<string, unknown>;
   accountId?: string | null;
   gateway?: {
@@ -235,9 +312,10 @@ export type ChannelToolSend = {
 };
 
 export type ChannelMessageActionAdapter = {
-  listActions?: (params: { cfg: ClawdbotConfig }) => ChannelMessageActionName[];
+  listActions?: (params: { cfg: OpenClawConfig }) => ChannelMessageActionName[];
   supportsAction?: (params: { action: ChannelMessageActionName }) => boolean;
-  supportsButtons?: (params: { cfg: ClawdbotConfig }) => boolean;
+  supportsButtons?: (params: { cfg: OpenClawConfig }) => boolean;
+  supportsCards?: (params: { cfg: OpenClawConfig }) => boolean;
   extractToolSend?: (params: { args: Record<string, unknown> }) => ChannelToolSend | null;
   handleAction?: (ctx: ChannelMessageActionContext) => Promise<AgentToolResult<unknown>>;
 };
@@ -251,8 +329,9 @@ export type ChannelPollResult = {
 };
 
 export type ChannelPollContext = {
-  cfg: ClawdbotConfig;
+  cfg: OpenClawConfig;
   to: string;
   poll: PollInput;
   accountId?: string | null;
+  threadId?: string | null;
 };

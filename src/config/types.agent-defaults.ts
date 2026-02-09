@@ -1,3 +1,4 @@
+import type { ChannelId } from "../channels/plugins/types.js";
 import type {
   BlockStreamingChunkConfig,
   BlockStreamingCoalesceConfig,
@@ -15,6 +16,8 @@ export type AgentModelEntryConfig = {
   alias?: string;
   /** Provider-specific API parameters (e.g., GLM-4.7 thinking mode). */
   params?: Record<string, unknown>;
+  /** Enable streaming for this model (default: true, false for Ollama to avoid SDK issue #1205). */
+  streaming?: boolean;
 };
 
 export type AgentModelListConfig = {
@@ -23,7 +26,9 @@ export type AgentModelListConfig = {
 };
 
 export type AgentContextPruningConfig = {
-  mode?: "off" | "adaptive" | "aggressive";
+  mode?: "off" | "cache-ttl";
+  /** TTL to consider cache expired (duration string, default unit: minutes). */
+  ttl?: string;
   keepLastAssistants?: number;
   softTrimRatio?: number;
   hardClearRatio?: number;
@@ -97,13 +102,29 @@ export type AgentDefaultsConfig = {
   models?: Record<string, AgentModelEntryConfig>;
   /** Agent working directory (preferred). Used as the default cwd for agent runs. */
   workspace?: string;
+  /** Optional repository root for system prompt runtime line (overrides auto-detect). */
+  repoRoot?: string;
   /** Skip bootstrap (BOOTSTRAP.md creation, etc.) for pre-configured deployments. */
   skipBootstrap?: boolean;
   /** Max chars for injected bootstrap files before truncation (default: 20000). */
   bootstrapMaxChars?: number;
   /** Optional IANA timezone for the user (used in system prompt; defaults to host timezone). */
   userTimezone?: string;
-  /** Optional display-only context window override (used for % in status UIs). */
+  /** Time format in system prompt: auto (OS preference), 12-hour, or 24-hour. */
+  timeFormat?: "auto" | "12" | "24";
+  /**
+   * Envelope timestamp timezone: "utc" (default), "local", "user", or an IANA timezone string.
+   */
+  envelopeTimezone?: string;
+  /**
+   * Include absolute timestamps in message envelopes ("on" | "off", default: "on").
+   */
+  envelopeTimestamp?: "on" | "off";
+  /**
+   * Include elapsed time in message envelopes ("on" | "off", default: "on").
+   */
+  envelopeElapsed?: "on" | "off";
+  /** Optional context window cap (used for runtime estimates + status %). */
   contextTokens?: number;
   /** Optional CLI backends for text-only fallback (claude-cli, etc.). */
   cliBackends?: Record<string, CliBackendConfig>;
@@ -116,9 +137,9 @@ export type AgentDefaultsConfig = {
   /** Default thinking level when no /think directive is present. */
   thinkingDefault?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   /** Default verbose level when no /verbose directive is present. */
-  verboseDefault?: "off" | "on";
+  verboseDefault?: "off" | "on" | "full";
   /** Default elevated level when no /elevated directive is present. */
-  elevatedDefault?: "off" | "on";
+  elevatedDefault?: "off" | "on" | "ask" | "full";
   /** Default block streaming level when no override is present. */
   blockStreamingDefault?: "off" | "on";
   /**
@@ -146,22 +167,26 @@ export type AgentDefaultsConfig = {
   heartbeat?: {
     /** Heartbeat interval (duration string, default unit: minutes; default: 30m). */
     every?: string;
+    /** Optional active-hours window (local time); heartbeats run only inside this window. */
+    activeHours?: {
+      /** Start time (24h, HH:MM). Inclusive. */
+      start?: string;
+      /** End time (24h, HH:MM). Exclusive. Use "24:00" for end-of-day. */
+      end?: string;
+      /** Timezone for the window ("user", "local", or IANA TZ id). Default: "user". */
+      timezone?: string;
+    };
     /** Heartbeat model override (provider/model). */
     model?: string;
-    /** Delivery target (last|whatsapp|telegram|discord|slack|msteams|signal|imessage|none). */
-    target?:
-      | "last"
-      | "whatsapp"
-      | "telegram"
-      | "discord"
-      | "slack"
-      | "msteams"
-      | "signal"
-      | "imessage"
-      | "none";
+    /** Session key for heartbeat runs ("main" or explicit session key). */
+    session?: string;
+    /** Delivery target ("last", "none", or a channel id). */
+    target?: "last" | "none" | ChannelId;
     /** Optional delivery override (E.164 for WhatsApp, chat id for Telegram). */
     to?: string;
-    /** Override the heartbeat prompt body (default: "Read HEARTBEAT.md if exists. Consider outstanding tasks. Checkup sometimes on your human during (user local) day time."). */
+    /** Optional account id for multi-account channels. */
+    accountId?: string;
+    /** Override the heartbeat prompt body (default: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK."). */
     prompt?: string;
     /** Max chars allowed after HEARTBEAT_OK before delivery (default: 30). */
     ackMaxChars?: number;
@@ -183,6 +208,8 @@ export type AgentDefaultsConfig = {
     archiveAfterMinutes?: number;
     /** Default model selection for spawned sub-agents (string or {primary,fallbacks}). */
     model?: string | { primary?: string; fallbacks?: string[] };
+    /** Default thinking level for spawned sub-agents (e.g. "off", "low", "medium", "high"). */
+    thinking?: string;
   };
   /** Optional sandbox settings for non-main sessions. */
   sandbox?: {
@@ -223,6 +250,8 @@ export type AgentCompactionConfig = {
   mode?: AgentCompactionMode;
   /** Minimum reserve tokens enforced for Pi compaction (0 disables the floor). */
   reserveTokensFloor?: number;
+  /** Max share of context window for history during safeguard pruning (0.1–0.9, default 0.5). */
+  maxHistoryShare?: number;
   /** Pre-compaction memory flush (agentic turn). Default: enabled. */
   memoryFlush?: AgentCompactionMemoryFlushConfig;
 };
